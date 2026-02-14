@@ -550,7 +550,15 @@ def main():
                         help="Number of stratified sampling passes to average (1=single pass)")
     parser.add_argument("--dpixel_dir", default=None,
                         help="Skip download; load existing preprocessed .npy files from this dir")
+    parser.add_argument("--cache_dir", default=None,
+                        help="Directory to cache preprocessed data. Downloads are saved here "
+                             "and reused on subsequent runs (enables resumable batch processing)")
+    parser.add_argument("--download_only", action="store_true",
+                        help="Only download and preprocess (requires --cache_dir). Skip inference.")
     args = parser.parse_args()
+
+    if args.download_only and not args.cache_dir:
+        parser.error("--download_only requires --cache_dir")
 
     # ---- Device setup ----
     if args.device == "auto":
@@ -569,6 +577,14 @@ def main():
         parser.error("--input_tiff is required unless --dpixel_dir is provided")
     date_range = f"{args.start}/{args.end}"
 
+    # Skip if output already exists
+    emb_path = os.path.join(args.output, f"{grid_id}.npy")
+    scale_path = os.path.join(args.output, f"{grid_id}_scales.npy")
+    if not args.download_only and os.path.isfile(emb_path) and os.path.isfile(scale_path):
+        print(f"Output already exists: {emb_path}")
+        print("Skipping. Use a different --output to rerun.")
+        return
+
     t_start = datetime.now()
     print(f"\nStarted: {t_start:%Y-%m-%d %H:%M:%S}")
 
@@ -579,10 +595,21 @@ def main():
     print(f"Step 1: Download & preprocess")
     print(f"{'='*60}")
 
-    if args.dpixel_dir:
-        print(f"\nLoading preprocessed data from {args.dpixel_dir}")
+    # Resolve where to load/save preprocessed data
+    dpixel_load_dir = args.dpixel_dir
+    dpixel_save_dir = None
+    if args.cache_dir and not dpixel_load_dir:
+        cache_tile_dir = os.path.join(args.cache_dir, grid_id)
+        if os.path.isfile(os.path.join(cache_tile_dir, "s2", "bands.npy")):
+            dpixel_load_dir = cache_tile_dir
+            print(f"\nFound cached preprocessed data in {cache_tile_dir}")
+        else:
+            dpixel_save_dir = cache_tile_dir
+
+    if dpixel_load_dir:
+        print(f"\nLoading preprocessed data from {dpixel_load_dir}")
         # Support both flat layout (files in root) and subdirectory layout (s2/, s1/)
-        d = args.dpixel_dir
+        d = dpixel_load_dir
         if os.path.isdir(os.path.join(d, "s2")):
             s2_bands = np.load(os.path.join(d, "s2", "bands.npy"))
             s2_masks = np.load(os.path.join(d, "s2", "masks.npy"))
@@ -620,6 +647,25 @@ def main():
         s1_asc, s1_asc_doy, s1_desc, s1_desc_doy = process_s1(
             s1_items, crs, bounds, res, H, W, roi_mask=roi_mask)
         print(f"  Ascending: {s1_asc.shape[0]} passes, Descending: {s1_desc.shape[0]} passes")
+
+        # Save preprocessed data to cache if requested
+        if dpixel_save_dir:
+            print(f"\nSaving preprocessed data to {dpixel_save_dir}")
+            os.makedirs(os.path.join(dpixel_save_dir, "s2"), exist_ok=True)
+            os.makedirs(os.path.join(dpixel_save_dir, "s1"), exist_ok=True)
+            np.save(os.path.join(dpixel_save_dir, "s2", "bands.npy"), s2_bands)
+            np.save(os.path.join(dpixel_save_dir, "s2", "masks.npy"), s2_masks)
+            np.save(os.path.join(dpixel_save_dir, "s2", "doys.npy"), s2_doys)
+            np.save(os.path.join(dpixel_save_dir, "s1", "sar_ascending.npy"), s1_asc)
+            np.save(os.path.join(dpixel_save_dir, "s1", "sar_ascending_doy.npy"), s1_asc_doy)
+            np.save(os.path.join(dpixel_save_dir, "s1", "sar_descending.npy"), s1_desc)
+            np.save(os.path.join(dpixel_save_dir, "s1", "sar_descending_doy.npy"), s1_desc_doy)
+            print("  Saved.")
+
+    if args.download_only:
+        print(f"\n--download_only: skipping inference.")
+        print(f"Done: {datetime.now():%H:%M:%S} (total {datetime.now() - t_start})")
+        return
 
     # Convert types to match the dataset expectations
     s2_bands = s2_bands.astype(np.float32)
@@ -777,8 +823,6 @@ def main():
     out_scales = out_scales.reshape(H_actual, W_actual)
 
     os.makedirs(args.output, exist_ok=True)
-    emb_path = os.path.join(args.output, f"{grid_id}.npy")
-    scale_path = os.path.join(args.output, f"{grid_id}_scales.npy")
     np.save(emb_path, out_embeddings)
     np.save(scale_path, out_scales)
 

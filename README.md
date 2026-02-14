@@ -26,6 +26,14 @@ python pipeline.py \
   --output /tmp/embeddings/2024 \
   --device cpu --num_threads 20
 
+# With caching (saves preprocessed data for resumable batch runs)
+python pipeline.py \
+  --input_tiff global_map_0.1_degree_tiff/grid_51.05_10.35.tiff \
+  --checkpoint best_model_fsdp_20250608_220648_QAT.pt \
+  --output /tmp/embeddings/2024 \
+  --cache_dir /tmp/dpixel_cache \
+  --device cuda
+
 # Skip download, use existing preprocessed data
 python pipeline.py \
   --dpixel_dir /path/to/dpixel/grid_51.05_10.35 \
@@ -49,6 +57,7 @@ python pipeline.py \
 | `--batch_size` | 1024 | Inference batch size |
 | `--repeat_times` | 1 | Number of stratified sampling passes to average |
 | `--dpixel_dir` | | Load preprocessed `.npy` files instead of downloading |
+| `--cache_dir` | | Cache preprocessed data here; skips download on rerun |
 
 ## Dependencies
 

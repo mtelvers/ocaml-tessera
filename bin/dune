@@ -1,0 +1,3 @@
+(executable
+ (name pipeline)
+ (libraries stac_client gdal onnxruntime eio_main eio yojson unix bigarray mirage-crypto-rng.unix npy))
