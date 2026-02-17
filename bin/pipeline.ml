@@ -63,28 +63,50 @@ let get_asset_href (item : Stac_client.item) key =
 (** Printf to stderr for progress *)
 let eprintf fmt = Printf.eprintf fmt
 
+(* ======================== Flat bigarray types ======================== *)
+
+(** Flat 4D array: [n_dates][height][width][channels] as contiguous float bigarray.
+    Index: ((d * h + i) * w + j) * c + b *)
+type flat_4d = {
+  data : (float, float64_elt, c_layout) Array1.t;
+  n : int; h : int; w : int; c : int;
+}
+
+(** Flat 3D int array: [n_dates][height][width] as contiguous int bigarray.
+    Index: (d * h3 + i) * w3 + j *)
+type flat_3d_int = {
+  idata : (int, int_elt, c_layout) Array1.t;
+  n3 : int; h3 : int; w3 : int;
+}
+
+let empty_flat_4d = { data = Array1.create float64 c_layout 0; n = 0; h = 0; w = 0; c = 0 }
+let empty_flat_3d_int = { idata = Array1.create int c_layout 0; n3 = 0; h3 = 0; w3 = 0 }
+
 (* ======================== NPY helpers ======================== *)
 
-(** Load npy as float array array array array [n_dates][height][width][bands] *)
-let load_npy_4d filename =
+(** Load npy as flat 4D bigarray [n_dates][height][width][bands] *)
+let load_npy_4d_flat filename =
   let arr = Npy.load filename |> Result.get_ok in
   assert (Array.length arr.shape = 4);
   let n = arr.shape.(0) and h = arr.shape.(1) and w = arr.shape.(2) and c = arr.shape.(3) in
-  Array.init n (fun d ->
-    Array.init h (fun i ->
-      Array.init w (fun j ->
-        Array.init c (fun b ->
-          Npy.get_float arr (((d * h + i) * w + j) * c + b)))))
+  let total = n * h * w * c in
+  let data = Array1.create float64 c_layout total in
+  for i = 0 to total - 1 do
+    Array1.set data i (Npy.get_float arr i)
+  done;
+  { data; n; h; w; c }
 
-(** Load npy as int array array array [n_dates][height][width] for masks *)
-let load_npy_3d_int filename =
+(** Load npy as flat 3D int bigarray [n_dates][height][width] *)
+let load_npy_3d_int_flat filename =
   let arr = Npy.load filename |> Result.get_ok in
   assert (Array.length arr.shape = 3);
   let n = arr.shape.(0) and h = arr.shape.(1) and w = arr.shape.(2) in
-  Array.init n (fun d ->
-    Array.init h (fun i ->
-      Array.init w (fun j ->
-        Npy.get_int arr ((d * h + i) * w + j))))
+  let total = n * h * w in
+  let idata = Array1.create int c_layout total in
+  for i = 0 to total - 1 do
+    Array1.set idata i (Npy.get_int arr i)
+  done;
+  { idata; n3 = n; h3 = h; w3 = w }
 
 (** Load npy as int array [n] for doys *)
 let load_npy_1d_int filename =
@@ -185,6 +207,48 @@ let load_roi tiff_path =
     width = w;
     resolution;
     mask }
+
+(* ======================== Nested-to-flat converters (download path only) ======================== *)
+
+(** Convert nested float array array array array [n][h][w][c] to flat_4d *)
+let flatten_4d (arr : float array array array array) =
+  let n = Array.length arr in
+  if n = 0 then empty_flat_4d
+  else
+    let h = Array.length arr.(0) in
+    let w = Array.length arr.(0).(0) in
+    let c = Array.length arr.(0).(0).(0) in
+    let total = n * h * w * c in
+    let data = Array1.create float64 c_layout total in
+    for d = 0 to n - 1 do
+      for i = 0 to h - 1 do
+        for j = 0 to w - 1 do
+          let base = ((d * h + i) * w + j) * c in
+          for b = 0 to c - 1 do
+            Array1.set data (base + b) arr.(d).(i).(j).(b)
+          done
+        done
+      done
+    done;
+    { data; n; h; w; c }
+
+(** Convert nested int array array array [n][h][w] to flat_3d_int *)
+let flatten_3d_int (arr : int array array array) =
+  let n = Array.length arr in
+  if n = 0 then empty_flat_3d_int
+  else
+    let h = Array.length arr.(0) in
+    let w = Array.length arr.(0).(0) in
+    let total = n * h * w in
+    let idata = Array1.create int c_layout total in
+    for d = 0 to n - 1 do
+      for i = 0 to h - 1 do
+        for j = 0 to w - 1 do
+          Array1.set idata ((d * h + i) * w + j) arr.(d).(i).(j)
+        done
+      done
+    done;
+    { idata; n3 = n; h3 = h; w3 = w }
 
 (* ======================== COG reading via GDAL warp ======================== *)
 
@@ -494,83 +558,113 @@ let process_s1 ~(roi : roi) ~sw ~(client : Stac_client.t) items =
      Array.of_list (List.rev !desc_doys))
   end
 
-(* ======================== Stratified sampling ======================== *)
+(* ======================== Flat sampling (zero-allocation hot path) ======================== *)
 
-let stratified_select valid_idx sample_size offset =
-  let n = Array.length valid_idx in
-  if n = 0 then
+(** Like stratified_select but reads from buf[0..n_valid-1] instead of a full array.
+    Returns an array of sample_size selected indices. *)
+let stratified_select_sub buf n_valid sample_size offset =
+  if n_valid = 0 then
     Array.make sample_size 0
-  else if n <= sample_size then begin
-    let repeats = (sample_size / n) + 1 in
-    let tiled = Array.init (repeats * n) (fun i -> valid_idx.(i mod n)) in
-    let result = Array.sub tiled 0 sample_size in
+  else if n_valid <= sample_size then begin
+    let result = Array.init sample_size (fun i -> buf.(i mod n_valid)) in
     Array.sort compare result;
     result
   end else begin
     let bins = Array.init (sample_size + 1) (fun i ->
-      Float.of_int n *. Float.of_int i /. Float.of_int sample_size) in
+      Float.of_int n_valid *. Float.of_int i /. Float.of_int sample_size) in
     Array.init sample_size (fun i ->
       let lo = Float.to_int bins.(i) in
       let hi = Float.to_int bins.(i + 1) in
       let hi = if hi <= lo then lo + 1 else hi in
       let pos = lo + (offset mod (hi - lo)) in
-      valid_idx.(min pos (n - 1)))
+      buf.(min pos (n_valid - 1)))
   end
 
-(** Sample & normalise S2 data for one pixel. Returns flat float array of length sample_size_s2*11. *)
-let sample_s2 s2_bands_pixel s2_masks_pixel s2_doys offset =
-  (* s2_bands_pixel: float array array [n_dates][10]
-     s2_masks_pixel: int array [n_dates]
-     s2_doys: int array [n_dates] *)
-  let n_dates = Array.length s2_masks_pixel in
-  let valid_idx = Array.of_list (
-    let acc = ref [] in
-    for i = n_dates - 1 downto 0 do
-      if s2_masks_pixel.(i) > 0 then acc := i :: !acc
-    done;
-    !acc) in
-  let valid_idx = if Array.length valid_idx = 0 then
-    Array.init n_dates Fun.id
-  else valid_idx in
-  let idx = stratified_select valid_idx sample_size_s2 offset in
-  let result = Array.make (sample_size_s2 * 11) 0.0 in
+(** Sample S2 data for one pixel, writing directly into the ONNX input bigarray.
+    Reads from flat source bigarrays; no per-pixel allocations. *)
+let sample_s2_flat (s2b : flat_4d) (s2m : flat_3d_int) s2_doys
+    ~i ~j ~pass ~(dst : (float, float32_elt, c_layout) Array1.t) ~dst_offset =
+  let n_dates = s2m.n3 in
+  let valid_buf = Array.make n_dates 0 in
+  let n_valid = ref 0 in
+  for d = 0 to n_dates - 1 do
+    if Array1.get s2m.idata ((d * s2m.h3 + i) * s2m.w3 + j) > 0 then begin
+      valid_buf.(!n_valid) <- d;
+      incr n_valid
+    end
+  done;
+  let vn = if !n_valid = 0 then
+    (for d = 0 to n_dates - 1 do valid_buf.(d) <- d done; n_dates)
+  else !n_valid in
+  let idx = stratified_select_sub valid_buf vn sample_size_s2 pass in
   for t = 0 to sample_size_s2 - 1 do
     let ti = idx.(t) in
+    let src_base = ((ti * s2b.h + i) * s2b.w + j) * s2b.c in
+    let dst_base = dst_offset + t * 11 in
     for b = 0 to 9 do
-      result.(t * 11 + b) <-
-        (s2_bands_pixel.(ti).(b) -. s2_band_mean.(b)) /. (s2_band_std.(b) +. 1e-9)
+      let v = Array1.get s2b.data (src_base + b) in
+      Array1.set dst (dst_base + b)
+        ((v -. s2_band_mean.(b)) /. (s2_band_std.(b) +. 1e-9))
     done;
-    result.(t * 11 + 10) <- Float.of_int s2_doys.(ti)
-  done;
-  result
+    Array1.set dst (dst_base + 10) (Float.of_int s2_doys.(ti))
+  done
 
-(** Sample & normalise S1 data for one pixel. Returns flat float array of length sample_size_s1*3. *)
-let sample_s1 s1_asc_pixel s1_asc_doys s1_desc_pixel s1_desc_doys offset =
-  (* s1_asc_pixel: float array array [n_asc][2]
-     s1_desc_pixel: float array array [n_desc][2] *)
-  let s1_all = Array.append s1_asc_pixel s1_desc_pixel in
-  let doys_all = Array.append s1_asc_doys s1_desc_doys in
-  let n = Array.length s1_all in
-  let valid_idx = Array.of_list (
-    let acc = ref [] in
-    for i = n - 1 downto 0 do
-      if Array.exists (fun v -> v <> 0.0) s1_all.(i) then acc := i :: !acc
-    done;
-    !acc) in
-  let valid_idx = if Array.length valid_idx = 0 then
-    Array.init n Fun.id
-  else valid_idx in
-  let idx = stratified_select valid_idx sample_size_s1 offset in
-  let result = Array.make (sample_size_s1 * 3) 0.0 in
+(** Sample S1 data for one pixel, writing directly into the ONNX input bigarray.
+    Merges ascending + descending, reads from flat source bigarrays. *)
+let sample_s1_flat (s1_asc : flat_4d) s1_asc_doy (s1_desc : flat_4d) s1_desc_doy
+    ~i ~j ~pass ~(dst : (float, float32_elt, c_layout) Array1.t) ~dst_offset =
+  let n_asc = s1_asc.n in
+  let n_desc = s1_desc.n in
+  let n_total = n_asc + n_desc in
+  let valid_buf = Array.make n_total 0 in
+  let n_valid = ref 0 in
+  (* Check ascending *)
+  for d = 0 to n_asc - 1 do
+    let base = ((d * s1_asc.h + i) * s1_asc.w + j) * s1_asc.c in
+    let vv = Array1.get s1_asc.data base in
+    let vh = Array1.get s1_asc.data (base + 1) in
+    if vv <> 0.0 || vh <> 0.0 then begin
+      valid_buf.(!n_valid) <- d;
+      incr n_valid
+    end
+  done;
+  (* Check descending — indices offset by n_asc *)
+  for d = 0 to n_desc - 1 do
+    let base = ((d * s1_desc.h + i) * s1_desc.w + j) * s1_desc.c in
+    let vv = Array1.get s1_desc.data base in
+    let vh = Array1.get s1_desc.data (base + 1) in
+    if vv <> 0.0 || vh <> 0.0 then begin
+      valid_buf.(!n_valid) <- n_asc + d;
+      incr n_valid
+    end
+  done;
+  let vn = if !n_valid = 0 then
+    (for k = 0 to n_total - 1 do valid_buf.(k) <- k done; n_total)
+  else !n_valid in
+  let idx = stratified_select_sub valid_buf vn sample_size_s1 pass in
   for t = 0 to sample_size_s1 - 1 do
     let ti = idx.(t) in
-    for b = 0 to 1 do
-      result.(t * 3 + b) <-
-        (s1_all.(ti).(b) -. s1_band_mean.(b)) /. (s1_band_std.(b) +. 1e-9)
-    done;
-    result.(t * 3 + 2) <- Float.of_int doys_all.(ti)
-  done;
-  result
+    let dst_base = dst_offset + t * 3 in
+    (* Determine which array and local index *)
+    if ti < n_asc then begin
+      let src_base = ((ti * s1_asc.h + i) * s1_asc.w + j) * s1_asc.c in
+      for b = 0 to 1 do
+        let v = Array1.get s1_asc.data (src_base + b) in
+        Array1.set dst (dst_base + b)
+          ((v -. s1_band_mean.(b)) /. (s1_band_std.(b) +. 1e-9))
+      done;
+      Array1.set dst (dst_base + 2) (Float.of_int s1_asc_doy.(ti))
+    end else begin
+      let d = ti - n_asc in
+      let src_base = ((d * s1_desc.h + i) * s1_desc.w + j) * s1_desc.c in
+      for b = 0 to 1 do
+        let v = Array1.get s1_desc.data (src_base + b) in
+        Array1.set dst (dst_base + b)
+          ((v -. s1_band_mean.(b)) /. (s1_band_std.(b) +. 1e-9))
+      done;
+      Array1.set dst (dst_base + 2) (Float.of_int s1_desc_doy.(d))
+    end
+  done
 
 (* ======================== Quantisation ======================== *)
 
@@ -600,6 +694,7 @@ let () =
   let dpixel_dir = ref "" in
   let cache_dir = ref "" in
   let download_only = ref false in
+  let cuda_device = ref (-1) in
 
   let speclist = [
     ("--input_tiff", Arg.Set_string input_tiff, "Path to grid GeoTIFF");
@@ -614,6 +709,7 @@ let () =
     ("--dpixel_dir", Arg.Set_string dpixel_dir, "Load preprocessed .npy from dir");
     ("--cache_dir", Arg.Set_string cache_dir, "Cache preprocessed data");
     ("--download_only", Arg.Set download_only, "Only download, skip inference");
+    ("--cuda", Arg.Set_int cuda_device, "CUDA device ID (e.g. 0) for GPU inference");
   ] in
   Arg.parse speclist (fun _ -> ()) "Minimal OCaml Tessera pipeline";
 
@@ -661,13 +757,13 @@ let () =
       dpixel_save_dir := cache_tile_dir
   end;
 
-  (* These will hold the satellite data *)
-  let s2_bands_data = ref [||] in  (* [n_dates][H][W][10] *)
-  let s2_masks_data = ref [||] in  (* [n_dates][H][W] int *)
-  let s2_doys_data = ref [||] in   (* [n_dates] *)
-  let s1_asc_data = ref [||] in    (* [n_dates][H][W][2] *)
+  (* These will hold the satellite data as flat bigarrays *)
+  let s2_bands_data = ref empty_flat_4d in
+  let s2_masks_data = ref empty_flat_3d_int in
+  let s2_doys_data = ref [||] in
+  let s1_asc_data = ref empty_flat_4d in
   let s1_asc_doy_data = ref [||] in
-  let s1_desc_data = ref [||] in
+  let s1_desc_data = ref empty_flat_4d in
   let s1_desc_doy_data = ref [||] in
 
   if !dpixel_load_dir <> "" then begin
@@ -676,27 +772,27 @@ let () =
     let s2_dir = Filename.concat d "s2" in
     let has_subdirs = Sys.file_exists s2_dir && Sys.is_directory s2_dir in
     if has_subdirs then begin
-      s2_bands_data := load_npy_4d (Filename.concat s2_dir "bands.npy");
-      s2_masks_data := load_npy_3d_int (Filename.concat s2_dir "masks.npy");
+      s2_bands_data := load_npy_4d_flat (Filename.concat s2_dir "bands.npy");
+      s2_masks_data := load_npy_3d_int_flat (Filename.concat s2_dir "masks.npy");
       s2_doys_data := load_npy_1d_int (Filename.concat s2_dir "doys.npy");
       let s1_dir = Filename.concat d "s1" in
-      s1_asc_data := load_npy_4d (Filename.concat s1_dir "sar_ascending.npy");
+      s1_asc_data := load_npy_4d_flat (Filename.concat s1_dir "sar_ascending.npy");
       s1_asc_doy_data := load_npy_1d_int (Filename.concat s1_dir "sar_ascending_doy.npy");
-      s1_desc_data := load_npy_4d (Filename.concat s1_dir "sar_descending.npy");
+      s1_desc_data := load_npy_4d_flat (Filename.concat s1_dir "sar_descending.npy");
       s1_desc_doy_data := load_npy_1d_int (Filename.concat s1_dir "sar_descending_doy.npy");
     end else begin
-      s2_bands_data := load_npy_4d (Filename.concat d "bands.npy");
-      s2_masks_data := load_npy_3d_int (Filename.concat d "masks.npy");
+      s2_bands_data := load_npy_4d_flat (Filename.concat d "bands.npy");
+      s2_masks_data := load_npy_3d_int_flat (Filename.concat d "masks.npy");
       s2_doys_data := load_npy_1d_int (Filename.concat d "doys.npy");
-      s1_asc_data := load_npy_4d (Filename.concat d "sar_ascending.npy");
+      s1_asc_data := load_npy_4d_flat (Filename.concat d "sar_ascending.npy");
       s1_asc_doy_data := load_npy_1d_int (Filename.concat d "sar_ascending_doy.npy");
-      s1_desc_data := load_npy_4d (Filename.concat d "sar_descending.npy");
+      s1_desc_data := load_npy_4d_flat (Filename.concat d "sar_descending.npy");
       s1_desc_doy_data := load_npy_1d_int (Filename.concat d "sar_descending_doy.npy");
     end;
     Printf.printf "  S2: [%d] dates, S1 asc: [%d], S1 desc: [%d]\n%!"
-      (Array.length !s2_bands_data)
-      (Array.length !s1_asc_data)
-      (Array.length !s1_desc_data)
+      (!s2_bands_data).n
+      (!s1_asc_data).n
+      (!s1_desc_data).n
   end else begin
     (* Download via STAC + GDAL *)
     Eio_main.run @@ fun env ->
@@ -720,8 +816,8 @@ let () =
     Printf.printf "  Found %d scenes\n%!" (List.length s2_items);
     Printf.printf "Processing Sentinel-2...\n%!";
     let (s2b, s2m, s2d) = process_s2 ~roi ~sw ~client s2_items in
-    s2_bands_data := s2b;
-    s2_masks_data := s2m;
+    s2_bands_data := flatten_4d s2b;
+    s2_masks_data := flatten_3d_int s2m;
     s2_doys_data := s2d;
     Printf.printf "  Result: %d valid days\n%!" (Array.length s2b);
 
@@ -737,9 +833,9 @@ let () =
     Printf.printf "  Found %d scenes\n%!" (List.length s1_items);
     Printf.printf "Processing Sentinel-1...\n%!";
     let (s1a, s1ad, s1de, s1dd) = process_s1 ~roi ~sw ~client s1_items in
-    s1_asc_data := s1a;
+    s1_asc_data := flatten_4d s1a;
     s1_asc_doy_data := s1ad;
-    s1_desc_data := s1de;
+    s1_desc_data := flatten_4d s1de;
     s1_desc_doy_data := s1dd;
     Printf.printf "  Ascending: %d passes, Descending: %d passes\n%!"
       (Array.length s1a) (Array.length s1de);
@@ -759,23 +855,21 @@ let () =
     exit 0
   end;
 
-  let s2_bands = !s2_bands_data in  (* [n_dates][H][W][10] *)
-  let s2_masks = !s2_masks_data in  (* [n_dates][H][W] as float *)
+  let s2_bands = !s2_bands_data in
+  let s2_masks = !s2_masks_data in
   let s2_doys = !s2_doys_data in
   let s1_asc = !s1_asc_data in
   let s1_asc_doy = !s1_asc_doy_data in
   let s1_desc = !s1_desc_data in
   let s1_desc_doy = !s1_desc_doy_data in
 
-  (* Get spatial dimensions *)
+  (* Get spatial dimensions from flat types *)
   let h_actual, w_actual =
-    if Array.length s2_bands > 0 then
-      (Array.length s2_bands.(0), Array.length s2_bands.(0).(0))
-    else
-      failwith "No S2 data available"
+    if s2_bands.n > 0 then (s2_bands.h, s2_bands.w)
+    else failwith "No S2 data available"
   in
-  let s1_asc_empty = Array.length s1_asc = 0 in
-  let s1_desc_empty = Array.length s1_desc = 0 in
+  let s1_asc_empty = s1_asc.n = 0 in
+  let s1_desc_empty = s1_desc.n = 0 in
 
   let t_download = Unix.gettimeofday () in
   Printf.printf "\nDownload complete: %.1fs\n%!" (t_download -. t_start);
@@ -790,27 +884,34 @@ let () =
   for i = 0 to h_actual - 1 do
     for j = 0 to w_actual - 1 do
       let global_idx = i * w_actual + j in
-      (* S2 valid count *)
+      (* S2 valid count — flat indexing *)
       let s2_valid = ref 0 in
       let s2_nonzero = ref false in
-      for d = 0 to Array.length s2_bands - 1 do
-        if s2_masks.(d).(i).(j) > 0 then
-          incr s2_valid;
-        if not !s2_nonzero then
-          if Array.exists (fun v -> v <> 0.0) s2_bands.(d).(i).(j) then
-            s2_nonzero := true
+      for d = 0 to s2_bands.n - 1 do
+        let mask_idx = (d * s2_masks.h3 + i) * s2_masks.w3 + j in
+        if Array1.get s2_masks.idata mask_idx > 0 then incr s2_valid;
+        if not !s2_nonzero then begin
+          let base = ((d * s2_bands.h + i) * s2_bands.w + j) * s2_bands.c in
+          let found = ref false in
+          for b = 0 to s2_bands.c - 1 do
+            if Array1.get s2_bands.data (base + b) <> 0.0 then found := true
+          done;
+          if !found then s2_nonzero := true
+        end
       done;
-      (* S1 valid count *)
+      (* S1 valid count — flat indexing *)
       let s1_asc_valid = ref 0 in
       if not s1_asc_empty then
-        for d = 0 to Array.length s1_asc - 1 do
-          if Array.exists (fun v -> v <> 0.0) s1_asc.(d).(i).(j) then
+        for d = 0 to s1_asc.n - 1 do
+          let base = ((d * s1_asc.h + i) * s1_asc.w + j) * s1_asc.c in
+          if Array1.get s1_asc.data base <> 0.0 || Array1.get s1_asc.data (base + 1) <> 0.0 then
             incr s1_asc_valid
         done;
       let s1_desc_valid = ref 0 in
       if not s1_desc_empty then
-        for d = 0 to Array.length s1_desc - 1 do
-          if Array.exists (fun v -> v <> 0.0) s1_desc.(d).(i).(j) then
+        for d = 0 to s1_desc.n - 1 do
+          let base = ((d * s1_desc.h + i) * s1_desc.w + j) * s1_desc.c in
+          if Array1.get s1_desc.data base <> 0.0 || Array1.get s1_desc.data (base + 1) <> 0.0 then
             incr s1_desc_valid
         done;
       let s1_total = !s1_asc_valid + !s1_desc_valid in
@@ -840,7 +941,10 @@ let () =
 
   Printf.printf "Loading model: %s\n%!" !model_path;
   let env = Onnxruntime.Env.create ~log_level:3 "tessera" in
-  let session = Onnxruntime.Session.create env ~threads:!num_threads !model_path in
+  let cuda_opt = if !cuda_device >= 0 then Some !cuda_device else None in
+  let session = Onnxruntime.Session.create env ~threads:!num_threads ?cuda_device:cuda_opt !model_path in
+  if !cuda_device >= 0 then
+    Printf.printf "  Using CUDA device %d\n%!" !cuda_device;
   Printf.printf "  Model loaded successfully\n%!";
 
   (* ================================================================ *)
@@ -864,6 +968,18 @@ let () =
   let s2_input = Array1.create float32 c_layout (b * sample_size_s2 * 11) in
   let s1_input = Array1.create float32 c_layout (b * sample_size_s1 * 3) in
 
+  (* Create effective S1 arrays: dummy 1-date zero arrays when empty *)
+  let make_dummy_s1 () =
+    let total = 1 * h_actual * w_actual * 2 in
+    let data = Array1.create float64 c_layout total in
+    Array1.fill data 0.0;
+    { data; n = 1; h = h_actual; w = w_actual; c = 2 }
+  in
+  let s1_asc_eff = if s1_asc_empty then make_dummy_s1 () else s1_asc in
+  let s1_asc_doy_eff = if s1_asc_empty then [| 180 |] else s1_asc_doy in
+  let s1_desc_eff = if s1_desc_empty then make_dummy_s1 () else s1_desc in
+  let s1_desc_doy_eff = if s1_desc_empty then [| 180 |] else s1_desc_doy in
+
   for pass = 0 to r - 1 do
     Printf.printf "  Pass %d/%d\n%!" (pass + 1) r;
 
@@ -876,38 +992,18 @@ let () =
       Array1.fill s2_input 0.0;
       Array1.fill s1_input 0.0;
 
-      (* Fill batch *)
+      (* Fill batch — flat sampling, no per-pixel allocations *)
       for px_in_batch = 0 to actual_b - 1 do
         let px = start_px + px_in_batch in
         let (_global_idx, i, j) = valid_pixels.(px) in
 
-        (* S2 per-pixel data *)
-        let s2_bands_pixel = Array.init (Array.length s2_bands) (fun d ->
-          s2_bands.(d).(i).(j)) in
-        let s2_masks_pixel = Array.init (Array.length s2_masks) (fun d ->
-          s2_masks.(d).(i).(j)) in
-        let s2_sampled = sample_s2 s2_bands_pixel s2_masks_pixel s2_doys pass in
-        let s2_offset = px_in_batch * sample_size_s2 * 11 in
-        for k = 0 to sample_size_s2 * 11 - 1 do
-          Array1.set s2_input (s2_offset + k) s2_sampled.(k)
-        done;
+        sample_s2_flat s2_bands s2_masks s2_doys
+          ~i ~j ~pass ~dst:s2_input
+          ~dst_offset:(px_in_batch * sample_size_s2 * 11);
 
-        (* S1 per-pixel data *)
-        let asc_pixel = if not s1_asc_empty then
-          Array.init (Array.length s1_asc) (fun d -> s1_asc.(d).(i).(j))
-        else [| [| 0.0; 0.0 |] |] in
-        let asc_d = if not s1_asc_empty then s1_asc_doy
-        else [| 180 |] in
-        let desc_pixel = if not s1_desc_empty then
-          Array.init (Array.length s1_desc) (fun d -> s1_desc.(d).(i).(j))
-        else [| [| 0.0; 0.0 |] |] in
-        let desc_d = if not s1_desc_empty then s1_desc_doy
-        else [| 180 |] in
-        let s1_sampled = sample_s1 asc_pixel asc_d desc_pixel desc_d pass in
-        let s1_offset = px_in_batch * sample_size_s1 * 3 in
-        for k = 0 to sample_size_s1 * 3 - 1 do
-          Array1.set s1_input (s1_offset + k) s1_sampled.(k)
-        done
+        sample_s1_flat s1_asc_eff s1_asc_doy_eff s1_desc_eff s1_desc_doy_eff
+          ~i ~j ~pass ~dst:s1_input
+          ~dst_offset:(px_in_batch * sample_size_s1 * 3)
       done;
 
       (* Use sub-views for the last (possibly smaller) batch *)
