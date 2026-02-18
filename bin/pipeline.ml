@@ -12,6 +12,20 @@ let harmonisation_date_ymd = (2022, 1, 25)
 let harmonisation_offset = 1000.0
 let stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
+type data_source = MPC | AWS
+
+let aws_stac_url = "https://earth-search.aws.element84.com/v1"
+
+(* AWS S2 band names, same order as s2_bands for MPC *)
+let s2_bands_aws = [| "red"; "blue"; "green"; "nir"; "nir08";
+                       "rededge1"; "rededge2"; "rededge3"; "swir16"; "swir22" |]
+
+let cmr_url = "https://cmr.earthdata.nasa.gov/search/granules.json"
+let opera_collection_id = "C2777436413-ASF"
+
+let s2_band_names = function MPC -> s2_bands | AWS -> s2_bands_aws
+let scl_asset_name = function MPC -> "SCL" | AWS -> "scl"
+
 let s2_band_mean = [| 1711.0938; 1308.8511; 1546.4543; 3010.1293; 3106.5083;
                        2068.3044; 2685.0845; 2931.5889; 2514.6928; 1899.4922 |]
 let s2_band_std  = [| 1926.1026; 1862.9751; 1803.1792; 1741.7837; 1677.4543;
@@ -252,11 +266,17 @@ let flatten_3d_int (arr : int array array array) =
 
 (* ======================== COG reading via GDAL warp ======================== *)
 
-(** Read a single band from a COG URL, warped to target CRS/bounds/size.
-    Returns float64 data as flat array of length width*height. *)
+(** Convert a URL to a GDAL virtual filesystem path.
+    s3://bucket/key → /vsis3/bucket/key, https://... → /vsicurl/https://... *)
+let gdal_vsi_path url =
+  if String.length url > 5 && String.sub url 0 5 = "s3://" then
+    "/vsis3/" ^ String.sub url 5 (String.length url - 5)
+  else
+    "/vsicurl/" ^ url
+
 let read_cog_band ~dst_crs_wkt ~bounds:(left, bottom, right, top)
     ~width ~height url =
-  let src = Gdal.Dataset.open_ex ("/vsicurl/" ^ url) in
+  let src = Gdal.Dataset.open_ex (gdal_vsi_path url) in
   let opts = [
     "-t_srs"; dst_crs_wkt;
     "-te"; Printf.sprintf "%.15g" left;
@@ -290,7 +310,7 @@ let read_cog_band ~dst_crs_wkt ~bounds:(left, bottom, right, top)
 
 (** Process Sentinel-2 items: SCL cloud masking, smart mosaic, harmonisation.
     Returns (bands[n_dates][H][W][10], masks[n_dates][H][W], doys[n_dates]) *)
-let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) items =
+let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
   let h = roi.height and w = roi.width in
   let (left, bottom, right, top) = roi.bounds in
   if items = [] then begin
@@ -312,9 +332,11 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) items =
     let n_items = Array.length items_arr in
     let scl_data = Array.init n_items (fun i ->
       let item = items_arr.(i) in
-      (* Sign item for COG access *)
-      let signed_item = Stac_client.sign_planetary_computer ~sw client item in
-      match get_asset_href signed_item "SCL" with
+      let access_item = match data_source with
+        | MPC -> Stac_client.sign_planetary_computer ~sw client item
+        | AWS -> item
+      in
+      match get_asset_href access_item (scl_asset_name data_source) with
       | None ->
         eprintf "  Warning: item %s has no SCL asset\n%!" item.id;
         Array.make (h * w) 0.0
@@ -390,14 +412,17 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) items =
         (* Load and sign band COGs for each tile *)
         let tile_band_data = List.map (fun item_idx ->
           let item = items_arr.(item_idx) in
-          let signed_item = Stac_client.sign_planetary_computer ~sw client item in
+          let access_item = match data_source with
+            | MPC -> Stac_client.sign_planetary_computer ~sw client item
+            | AWS -> item
+          in
           Array.map (fun band_name ->
-            match get_asset_href signed_item band_name with
+            match get_asset_href access_item band_name with
             | None -> Array.make (h * w) 0.0
             | Some href ->
               read_cog_band ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
                 ~width:w ~height:h href
-          ) s2_bands
+          ) (s2_band_names data_source)
         ) indices in
         let tile_band_data = Array.of_list tile_band_data in
         let n_tiles = Array.length tile_band_data in
@@ -678,6 +703,230 @@ let quantize_symmetric x_f32 =
     Float.to_int v) in
   (quantized, scale)
 
+(* ======================== OPERA RTC-S1 (AWS) ======================== *)
+
+(** Read the NASA Earthdata bearer token from ~/.edl_bearer_token. *)
+let read_edl_token () =
+  let token_path = Filename.concat (Sys.getenv "HOME") ".edl_bearer_token" in
+  let ic = open_in token_path in
+  let token = String.trim (input_line ic) in
+  close_in ic;
+  token
+
+(** Set up GDAL HTTP auth for OPERA COG access via cumulus.
+    Creates a header file with Bearer token and sets GDAL_HTTP_HEADER_FILE. *)
+let setup_opera_gdal_auth token =
+  let header_path = Filename.concat (Filename.get_temp_dir_name ()) "gdal_opera_headers.txt" in
+  let oc = open_out header_path in
+  Printf.fprintf oc "Authorization: Bearer %s\nCookie: asf-urs=%s\n" token token;
+  close_out oc;
+  Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" (Some header_path);
+  eprintf "  GDAL OPERA auth configured\n%!"
+
+
+type opera_granule = {
+  og_date : string;
+  og_vv_url : string;
+  og_vh_url : string;
+}
+
+(** Search CMR for OPERA RTC-S1 granules. *)
+let search_cmr_opera ~sw ~(client : Stac_client.t)
+    ~bbox:(xmin, ymin, xmax, ymax) ~datetime =
+  let temporal =
+    match String.split_on_char '/' datetime with
+    | [s; e] ->
+      let fix d = if String.length d = 10 then d ^ "T00:00:00Z" else d in
+      fix s ^ "," ^ fix e
+    | _ -> datetime ^ "," ^ datetime
+  in
+  let bbox_str = Printf.sprintf "%.6f,%.6f,%.6f,%.6f" xmin ymin xmax ymax in
+  let rec fetch_all page_num acc =
+    let url = Printf.sprintf
+      "%s?collection_concept_id=%s&bounding_box=%s&temporal=%s&page_size=2000&page_num=%d"
+      cmr_url opera_collection_id bbox_str temporal page_num
+    in
+    let resp, body = Stac_client.http_get ~sw client url in
+    if Http.Status.compare resp.status `OK <> 0 then
+      failwith (Printf.sprintf "CMR search failed (%s): %s"
+        (Http.Status.to_string resp.status) body);
+    let json = Yojson.Safe.from_string body in
+    let entries = match json with
+      | `Assoc fields ->
+        (match List.assoc_opt "feed" fields with
+         | Some (`Assoc feed_fields) ->
+           (match List.assoc_opt "entry" feed_fields with
+            | Some (`List entries) -> entries
+            | _ -> [])
+         | _ -> [])
+      | _ -> []
+    in
+    if entries = [] then List.rev acc
+    else begin
+      let granules = List.filter_map (fun entry ->
+        match entry with
+        | `Assoc fields ->
+          let time_start = match List.assoc_opt "time_start" fields with
+            | Some (`String s) -> date_of_datetime s
+            | _ -> ""
+          in
+          if time_start = "" then None
+          else begin
+            let title = match List.assoc_opt "title" fields with
+              | Some (`String s) -> s
+              | _ -> ""
+            in
+            if title = "" then begin
+              eprintf "  Warning: skipping CMR entry without title\n%!";
+              None
+            end else
+              let base = Printf.sprintf
+                "https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/%s/%s"
+                title title in
+              Some { og_date = time_start;
+                     og_vv_url = base ^ "_VV.tif";
+                     og_vh_url = base ^ "_VH.tif" }
+          end
+        | _ -> None
+      ) entries in
+      let acc = List.rev_append granules acc in
+      if List.length entries < 2000 then List.rev acc
+      else fetch_all (page_num + 1) acc
+    end
+  in
+  fetch_all 1 []
+
+(** Read orbit direction from a GDAL dataset's metadata tags. *)
+let read_orbit_direction_from_cog url =
+  let ds = Gdal.Dataset.open_ex (gdal_vsi_path url) in
+  if Gdal.Dataset.is_null ds then begin
+    eprintf "  Warning: could not open COG for orbit metadata\n%!";
+    "unknown"
+  end else begin
+    let result =
+      match Gdal.Dataset.get_metadata_item ds "ORBIT_PASS_DIRECTION" None with
+      | Some s -> String.lowercase_ascii s
+      | None ->
+        match Gdal.Dataset.get_metadata_item ds "ORBIT_PASS_DIRECTION" (Some "") with
+        | Some s -> String.lowercase_ascii s
+        | None -> "unknown"
+    in
+    Gdal.Dataset.close ds;
+    result
+  end
+
+(** Process Sentinel-1 OPERA RTC data from AWS/CMR into asc/desc arrays. *)
+let process_s1_opera ~(roi : roi) ~sw ~(client : Stac_client.t)
+    ~bbox ~datetime =
+  let h = roi.height and w = roi.width in
+  let (left, bottom, right, top) = roi.bounds in
+  let token = read_edl_token () in
+  ignore (sw, client);
+  (* Set up GDAL auth for cumulus OPERA COG access *)
+  setup_opera_gdal_auth token;
+  Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" (Some "EMPTY_DIR");
+  eprintf "  Searching CMR for OPERA RTC-S1...\n%!";
+  let granules = search_cmr_opera ~sw ~client ~bbox ~datetime in
+  eprintf "  Found %d OPERA granules\n%!" (List.length granules);
+  if granules = [] then begin
+    eprintf "  No OPERA S1 granules found\n%!";
+    ([||], [||], [||], [||])
+  end else begin
+    eprintf "  Loading OPERA SAR data...\n%!";
+    (* Group granules by date *)
+    let by_date = Hashtbl.create 64 in
+    List.iter (fun g ->
+      let prev = try Hashtbl.find by_date g.og_date with Not_found -> [] in
+      Hashtbl.replace by_date g.og_date (g :: prev)
+    ) granules;
+
+    let asc_data = ref [] in
+    let asc_doys = ref [] in
+    let desc_data = ref [] in
+    let desc_doys = ref [] in
+
+    let sorted_dates = List.sort String.compare
+      (Hashtbl.fold (fun k _ acc -> k :: acc) by_date []) in
+    List.iter (fun date_str ->
+      let day_granules = List.rev (Hashtbl.find by_date date_str) in
+      let doy = doy_of_date_str date_str in
+
+      (* Group by orbit direction — read from first granule's metadata *)
+      let by_orbit = Hashtbl.create 4 in
+      List.iter (fun g ->
+        let orbit = read_orbit_direction_from_cog g.og_vv_url in
+        let prev = try Hashtbl.find by_orbit orbit with Not_found -> [] in
+        Hashtbl.replace by_orbit orbit (g :: prev)
+      ) day_granules;
+
+      Hashtbl.iter (fun orbit orbit_granules ->
+        (* For each granule: read VV & VH, convert to dB, mosaic *)
+        let mosaic_pol get_url =
+          let db_list = List.filter_map (fun g ->
+            let url = get_url g in
+            let amp = read_cog_band ~dst_crs_wkt:roi.crs_wkt
+              ~bounds:(left, bottom, right, top) ~width:w ~height:h url in
+            let db = amplitude_to_db amp roi.mask h w in
+            (* Check if any valid pixel *)
+            let has_any = ref false in
+            Array.iter (fun row ->
+              Array.iter (fun v -> if v > 0 then has_any := true) row) db;
+            if !has_any then Some db else None
+          ) orbit_granules in
+          if db_list = [] then None
+          else begin
+            let sum = Array.init h (fun _ -> Array.make w 0.0) in
+            let cnt = Array.init h (fun _ -> Array.make w 0) in
+            List.iter (fun db ->
+              for i = 0 to h - 1 do
+                for j = 0 to w - 1 do
+                  if db.(i).(j) > 0 then begin
+                    sum.(i).(j) <- sum.(i).(j) +. Float.of_int db.(i).(j);
+                    cnt.(i).(j) <- cnt.(i).(j) + 1
+                  end
+                done
+              done
+            ) db_list;
+            let out = Array.init h (fun i ->
+              Array.init w (fun j ->
+                if cnt.(i).(j) > 0
+                then Float.to_int (sum.(i).(j) /. Float.of_int cnt.(i).(j))
+                else 0)) in
+            Some out
+          end
+        in
+
+        let vv_out = mosaic_pol (fun g -> g.og_vv_url) in
+        let vh_out = mosaic_pol (fun g -> g.og_vh_url) in
+        match vv_out, vh_out with
+        | None, None -> ()
+        | _ ->
+          let vv = match vv_out with Some v -> v
+            | None -> Array.init h (fun _ -> Array.make w 0) in
+          let vh = match vh_out with Some v -> v
+            | None -> Array.init h (fun _ -> Array.make w 0) in
+          let combined = Array.init h (fun i ->
+            Array.init w (fun j ->
+              [| Float.of_int vv.(i).(j); Float.of_int vh.(i).(j) |])) in
+          if orbit = "ascending" then begin
+            asc_data := combined :: !asc_data;
+            asc_doys := doy :: !asc_doys
+          end else begin
+            desc_data := combined :: !desc_data;
+            desc_doys := doy :: !desc_doys
+          end
+      ) by_orbit
+    ) sorted_dates;
+
+    (* Clean up GDAL auth state *)
+    Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" None;
+    Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" None;
+    (Array.of_list (List.rev !asc_data),
+     Array.of_list (List.rev !asc_doys),
+     Array.of_list (List.rev !desc_data),
+     Array.of_list (List.rev !desc_doys))
+  end
+
 (* ======================== Main pipeline ======================== *)
 
 let () =
@@ -695,6 +944,7 @@ let () =
   let cache_dir = ref "" in
   let download_only = ref false in
   let cuda_device = ref (-1) in
+  let data_source_str = ref "mpc" in
 
   let speclist = [
     ("--input_tiff", Arg.Set_string input_tiff, "Path to grid GeoTIFF");
@@ -710,8 +960,15 @@ let () =
     ("--cache_dir", Arg.Set_string cache_dir, "Cache preprocessed data");
     ("--download_only", Arg.Set download_only, "Only download, skip inference");
     ("--cuda", Arg.Set_int cuda_device, "CUDA device ID (e.g. 0) for GPU inference");
+    ("--data_source", Arg.Set_string data_source_str, "Data source: mpc or aws (default: mpc)");
   ] in
   Arg.parse speclist (fun _ -> ()) "Minimal OCaml Tessera pipeline";
+
+  let data_source = match String.lowercase_ascii !data_source_str with
+    | "mpc" -> MPC
+    | "aws" -> AWS
+    | s -> failwith (Printf.sprintf "Unknown data source: %s (expected mpc or aws)" s)
+  in
 
   if !download_only && !cache_dir = "" then
     failwith "--download_only requires --cache_dir";
@@ -749,8 +1006,9 @@ let () =
   let dpixel_save_dir = ref "" in
   if !cache_dir <> "" && !dpixel_load_dir = "" then begin
     let cache_tile_dir = Filename.concat !cache_dir grid_id in
-    let check_path = Filename.concat (Filename.concat cache_tile_dir "s2") "bands.npy" in
-    if Sys.file_exists check_path then begin
+    let check_subdir = Filename.concat (Filename.concat cache_tile_dir "s2") "bands.npy" in
+    let check_flat = Filename.concat cache_tile_dir "bands.npy" in
+    if Sys.file_exists check_subdir || Sys.file_exists check_flat then begin
       dpixel_load_dir := cache_tile_dir;
       Printf.printf "\nFound cached preprocessed data in %s\n%!" cache_tile_dir
     end else
@@ -804,7 +1062,19 @@ let () =
     Printf.printf "  Tile: %dx%d, resolution=%.6f\n%!" roi.height roi.width roi.resolution;
     let (xmin, ymin, xmax, ymax) = roi.bbox in
 
-    Printf.printf "\nSearching Sentinel-2 (%s)...\n%!" date_range;
+    (* Set GDAL COG optimization for AWS sources *)
+    if data_source = AWS then begin
+      Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" (Some "EMPTY_DIR");
+      Gdal.set_config_option "GDAL_HTTP_MULTIRANGE" (Some "YES");
+      Gdal.set_config_option "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES" (Some "YES");
+    end;
+
+    let s2_base_url = match data_source with
+      | MPC -> stac_url
+      | AWS -> aws_stac_url
+    in
+    Printf.printf "\nSearching Sentinel-2 [%s] (%s)...\n%!"
+      (match data_source with MPC -> "MPC" | AWS -> "AWS") date_range;
     let s2_params : Stac_client.search_params = {
       collections = ["sentinel-2-l2a"];
       bbox = [xmin; ymin; xmax; ymax];
@@ -812,27 +1082,35 @@ let () =
       query = Some (`Assoc ["eo:cloud_cover", `Assoc ["lt", `Float !max_cloud]]);
       limit = None;
     } in
-    let s2_items = Stac_client.search ~sw client ~base_url:stac_url s2_params in
+    let s2_items = Stac_client.search ~sw client ~base_url:s2_base_url s2_params in
     Printf.printf "  Found %d scenes\n%!" (List.length s2_items);
     Printf.printf "Processing Sentinel-2...\n%!";
-    let (s2b, s2m, s2d) = process_s2 ~roi ~sw ~client s2_items in
+    let (s2b, s2m, s2d) = process_s2 ~roi ~sw ~client ~data_source s2_items in
     s2_bands_data := flatten_4d s2b;
     s2_masks_data := flatten_3d_int s2m;
     s2_doys_data := s2d;
     Printf.printf "  Result: %d valid days\n%!" (Array.length s2b);
 
-    Printf.printf "\nSearching Sentinel-1 (%s)...\n%!" date_range;
-    let s1_params : Stac_client.search_params = {
-      collections = ["sentinel-1-rtc"];
-      bbox = [xmin; ymin; xmax; ymax];
-      datetime = date_range;
-      query = None;
-      limit = None;
-    } in
-    let s1_items = Stac_client.search ~sw client ~base_url:stac_url s1_params in
-    Printf.printf "  Found %d scenes\n%!" (List.length s1_items);
-    Printf.printf "Processing Sentinel-1...\n%!";
-    let (s1a, s1ad, s1de, s1dd) = process_s1 ~roi ~sw ~client s1_items in
+    Printf.printf "\nSearching Sentinel-1 [%s] (%s)...\n%!"
+      (match data_source with MPC -> "MPC" | AWS -> "AWS/OPERA") date_range;
+    let (s1a, s1ad, s1de, s1dd) = match data_source with
+      | MPC ->
+        let s1_params : Stac_client.search_params = {
+          collections = ["sentinel-1-rtc"];
+          bbox = [xmin; ymin; xmax; ymax];
+          datetime = date_range;
+          query = None;
+          limit = None;
+        } in
+        let s1_items = Stac_client.search ~sw client ~base_url:stac_url s1_params in
+        Printf.printf "  Found %d scenes\n%!" (List.length s1_items);
+        Printf.printf "Processing Sentinel-1...\n%!";
+        process_s1 ~roi ~sw ~client s1_items
+      | AWS ->
+        Printf.printf "Processing Sentinel-1 (OPERA RTC)...\n%!";
+        process_s1_opera ~roi ~sw ~client
+          ~bbox:(xmin, ymin, xmax, ymax) ~datetime:date_range
+    in
     s1_asc_data := flatten_4d s1a;
     s1_asc_doy_data := s1ad;
     s1_desc_data := flatten_4d s1de;
@@ -842,10 +1120,30 @@ let () =
 
     (* Save to cache if requested *)
     if !dpixel_save_dir <> "" then begin
-      Printf.printf "\nSaving preprocessed data to %s\n%!" !dpixel_save_dir;
-      (* Note: we'd need to implement npy save for multi-dim arrays.
-         For now, just note the cache save is TODO for the download path. *)
-      Printf.printf "  (cache save not yet implemented in OCaml pipeline)\n%!"
+      let d = !dpixel_save_dir in
+      (try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+      Printf.printf "\nSaving preprocessed data to %s\n%!" d;
+      let save_flat_4d path (f : flat_4d) =
+        let total = f.n * f.h * f.w * f.c in
+        let arr = Array.init total (fun i -> Array1.get f.data i) in
+        Npy.save path (Npy.of_float_array Npy.Float64 [| f.n; f.h; f.w; f.c |] arr)
+      in
+      let save_flat_3d_int path (f : flat_3d_int) =
+        let total = f.n3 * f.h3 * f.w3 in
+        let arr = Array.init total (fun i -> Array1.get f.idata i) in
+        Npy.save path (Npy.of_int_array Npy.Int32 [| f.n3; f.h3; f.w3 |] arr)
+      in
+      let save_1d_int path arr =
+        Npy.save path (Npy.of_int_array Npy.Int32 [| Array.length arr |] arr)
+      in
+      save_flat_4d (Filename.concat d "bands.npy") !s2_bands_data;
+      save_flat_3d_int (Filename.concat d "masks.npy") !s2_masks_data;
+      save_1d_int (Filename.concat d "doys.npy") !s2_doys_data;
+      save_flat_4d (Filename.concat d "sar_ascending.npy") !s1_asc_data;
+      save_1d_int (Filename.concat d "sar_ascending_doy.npy") !s1_asc_doy_data;
+      save_flat_4d (Filename.concat d "sar_descending.npy") !s1_desc_data;
+      save_1d_int (Filename.concat d "sar_descending_doy.npy") !s1_desc_doy_data;
+      Printf.printf "  Saved 7 .npy files\n%!"
     end
   end;
 
