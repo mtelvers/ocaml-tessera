@@ -161,48 +161,8 @@ let load_roi tiff_path =
   let resolution = Float.abs pixel_w in
   let crs_wkt = Gdal.Dataset.projection ds in
   (* Transform bounds to EPSG:4326 *)
-  let src_srs = Gdal.SpatialReference.of_epsg 4326 |> Result.get_ok in (* dummy, will parse from WKT *)
-  (* We need to create SRS from WKT. Use the dataset's projection string.
-     For simplicity, extract EPSG from the WKT if possible, otherwise use transform. *)
-  (* Actually, we need to create an SRS from the dataset projection.
-     The GDAL bindings have of_epsg. Let's try to extract EPSG code from projection. *)
-  let epsg_code =
-    (* Try to find EPSG code in WKT *)
-    try
-      let wkt = crs_wkt in
-      let pat = "EPSG" in
-      let idx = ref 0 in
-      let found = ref false in
-      let code = ref 4326 in
-      (try
-         for k = String.length wkt - 10 downto 0 do
-           if String.length wkt > k + 4 &&
-              String.sub wkt k 4 = pat then begin
-             (* Look for digits after "EPSG","<digits>" *)
-             let start = k + 4 in
-             (* Find first digit *)
-             let dstart = ref start in
-             while !dstart < String.length wkt && not (Char.code wkt.[!dstart] >= 48 && Char.code wkt.[!dstart] <= 57) do
-               incr dstart
-             done;
-             let dend = ref !dstart in
-             while !dend < String.length wkt && Char.code wkt.[!dend] >= 48 && Char.code wkt.[!dend] <= 57 do
-               incr dend
-             done;
-             if !dend > !dstart then begin
-               idx := !dstart;
-               code := int_of_string (String.sub wkt !dstart (!dend - !dstart));
-               found := true;
-               raise Exit
-             end
-           end
-         done
-       with Exit -> ());
-      ignore (idx, found);
-      !code
-    with _ -> 4326
-  in
-  let tile_srs = Gdal.SpatialReference.of_epsg epsg_code |> Result.get_ok in
+  let src_srs = Gdal.SpatialReference.of_epsg 4326 |> Result.get_ok in
+  let tile_srs = Gdal.SpatialReference.of_wkt crs_wkt |> Result.get_ok in
   let ct = Gdal.CoordinateTransformation.create tile_srs src_srs |> Result.get_ok in
   let (xmin4326, ymin4326, xmax4326, ymax4326) =
     Gdal.CoordinateTransformation.transform_bounds ct
