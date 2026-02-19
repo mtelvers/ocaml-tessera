@@ -234,7 +234,7 @@ let gdal_vsi_path url =
   else
     "/vsicurl/" ^ url
 
-let read_cog_band ~dst_crs_wkt ~bounds:(left, bottom, right, top)
+let warp_to_mem ~dst_crs_wkt ~bounds:(left, bottom, right, top)
     ~width ~height url =
   let src = Gdal.Dataset.open_ex (gdal_vsi_path url) in
   let opts = [
@@ -247,7 +247,10 @@ let read_cog_band ~dst_crs_wkt ~bounds:(left, bottom, right, top)
     "-r"; "near";
     "-of"; "MEM";
   ] in
-  match Gdal.Dataset.warp ~options:opts ~src "/vsimem/tmp_warp" with
+  Gdal.Dataset.warp ~options:opts ~src "/vsimem/tmp_warp"
+
+let read_cog_band ~dst_crs_wkt ~bounds ~width ~height url =
+  match warp_to_mem ~dst_crs_wkt ~bounds ~width ~height url with
   | Error _ ->
     eprintf "Warning: warp failed for %s\n%!" url;
     Array.make (height * width) 0.0
@@ -255,16 +258,34 @@ let read_cog_band ~dst_crs_wkt ~bounds:(left, bottom, right, top)
     let band = Gdal.Dataset.raster_band warped 1 |> Option.get in
     let w_out = Gdal.RasterBand.x_size band in
     let h_out = Gdal.RasterBand.y_size band in
-    (match Gdal.RasterBand.read ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out
-             ~buf_x_size:w_out ~buf_y_size:h_out band with
-     | Ok ba ->
-       let arr = Array.init (h_out * w_out) (fun i -> Array1.get ba i) in
-       Gdal.Dataset.close warped;
-       arr
-     | Error _ ->
-       eprintf "Warning: band read failed for %s\n%!" url;
-       Gdal.Dataset.close warped;
-       Array.make (height * width) 0.0)
+    match Gdal.RasterBand.read ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out
+            ~buf_x_size:w_out ~buf_y_size:h_out band with
+    | Ok ba ->
+      let arr = Array.init (h_out * w_out) (fun i -> Array1.get ba i) in
+      Gdal.Dataset.close warped; arr
+    | Error _ ->
+      eprintf "Warning: band read failed for %s\n%!" url;
+      Gdal.Dataset.close warped;
+      Array.make (height * width) 0.0
+
+let read_cog_band_byte ~dst_crs_wkt ~bounds ~width ~height url =
+  match warp_to_mem ~dst_crs_wkt ~bounds ~width ~height url with
+  | Error _ ->
+    eprintf "Warning: warp failed for %s\n%!" url;
+    Array.make (height * width) 0
+  | Ok warped ->
+    let band = Gdal.Dataset.raster_band warped 1 |> Option.get in
+    let w_out = Gdal.RasterBand.x_size band in
+    let h_out = Gdal.RasterBand.y_size band in
+    match Gdal.RasterBand.read_byte ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out
+            ~buf_x_size:w_out ~buf_y_size:h_out band with
+    | Ok ba ->
+      let arr = Array.init (h_out * w_out) (fun i -> Array1.get ba i) in
+      Gdal.Dataset.close warped; arr
+    | Error _ ->
+      eprintf "Warning: band read failed for %s\n%!" url;
+      Gdal.Dataset.close warped;
+      Array.make (height * width) 0
 
 (* ======================== process_s2 ======================== *)
 
@@ -299,9 +320,9 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
       match get_asset_href access_item (scl_asset_name data_source) with
       | None ->
         eprintf "  Warning: item %s has no SCL asset\n%!" item.id;
-        Array.make (h * w) 0.0
+        Array.make (h * w) 0
       | Some href ->
-        read_cog_band ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
+        read_cog_band_byte ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
           ~width:w ~height:h href
     ) in
 
@@ -323,7 +344,7 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
         for i = 0 to h - 1 do
           for j = 0 to w - 1 do
             if roi.mask.(i).(j) > 0 && not assigned.(i).(j) then begin
-              let v = Float.to_int (Float.round scl.(i * w + j)) in
+              let v = scl.(i * w + j) in
               if not (is_scl_invalid v) then begin
                 tile_sel.(i).(j) <- _t_idx;
                 assigned.(i).(j) <- true
