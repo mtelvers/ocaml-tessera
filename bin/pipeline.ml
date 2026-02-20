@@ -96,6 +96,19 @@ type flat_3d_int = {
 let empty_flat_4d = { data = Array1.create float64 c_layout 0; n = 0; h = 0; w = 0; c = 0 }
 let empty_flat_3d_int = { idata = Array1.create int c_layout 0; n3 = 0; h3 = 0; w3 = 0 }
 
+(** S1 tile: URLs for a single SAR tile's VV and VH polarisations *)
+type s1_tile = {
+  st_vv : string option;
+  st_vh : string option;
+}
+
+(** S1 group: one (date, orbit) combination with its tiles *)
+type s1_group = {
+  sg_date : string;
+  sg_orbit : string;
+  sg_tiles : s1_tile list;
+}
+
 (* ======================== NPY helpers ======================== *)
 
 (** Load npy as flat 4D bigarray [n_dates][height][width][bands] *)
@@ -448,7 +461,7 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
     end
   end
 
-(* ======================== process_s1 ======================== *)
+(* ======================== S1 processing ======================== *)
 
 (** amplitude_to_db: (20*log10(amp) + 50) * 200, clipped to [0, 32767] *)
 let amplitude_to_db amp_arr mask_arr h w =
@@ -467,16 +480,11 @@ let amplitude_to_db amp_arr mask_arr h w =
   done;
   out
 
-(** Process Sentinel-1 items into ascending/descending arrays. *)
-let process_s1 ~(roi : roi) ~sw ~(client : Stac_client.t) items =
-  let h = roi.height and w = roi.width in
-  let (left, bottom, right, top) = roi.bounds in
-  if items = [] then begin
-    eprintf "  No S1 items found\n%!";
-    ([||], [||], [||], [||])
-  end else begin
-    eprintf "  Loading SAR data...\n%!";
-    (* Group by (date, orbit) *)
+(** Prepare Sentinel-1 groups from MPC STAC items.
+    Signs each item and extracts VV/VH asset hrefs. *)
+let prepare_s1_mpc ~sw ~(client : Stac_client.t) items =
+  if items = [] then []
+  else begin
     let by_date_orbit = Hashtbl.create 64 in
     List.iter (fun (item : Stac_client.item) ->
       let dt = date_of_datetime (match Stac_client.get_datetime item with Some d -> d | None -> "") in
@@ -486,32 +494,51 @@ let process_s1 ~(roi : roi) ~sw ~(client : Stac_client.t) items =
       let prev = try Hashtbl.find by_date_orbit key with Not_found -> [] in
       Hashtbl.replace by_date_orbit key (item :: prev)
     ) items;
+    let sorted_keys = List.sort compare (Hashtbl.fold (fun k _ acc -> k :: acc) by_date_orbit []) in
+    List.map (fun (date_str, orbit) ->
+      let group_items = List.rev (Hashtbl.find by_date_orbit (date_str, orbit)) in
+      let tiles = List.map (fun (item : Stac_client.item) ->
+        let signed = Stac_client.sign_planetary_computer ~sw client item in
+        { st_vv = get_asset_href signed "vv";
+          st_vh = get_asset_href signed "vh" }
+      ) group_items in
+      { sg_date = date_str; sg_orbit = orbit; sg_tiles = tiles }
+    ) sorted_keys
+  end
 
+(** Process prepared S1 groups into ascending/descending arrays.
+    Common processing for both MPC and OPERA data sources. *)
+let process_s1_groups ~(roi : roi) groups =
+  let h = roi.height and w = roi.width in
+  let (left, bottom, right, top) = roi.bounds in
+  if groups = [] then begin
+    eprintf "  No S1 data to process\n%!";
+    ([||], [||], [||], [||])
+  end else begin
+    eprintf "  Loading SAR data (%d groups)...\n%!" (List.length groups);
     let asc_data = ref [] in
     let asc_doys = ref [] in
     let desc_data = ref [] in
     let desc_doys = ref [] in
 
-    let sorted_keys = List.sort compare (Hashtbl.fold (fun k _ acc -> k :: acc) by_date_orbit []) in
-    List.iter (fun (date_str, orbit) ->
-      let group_items = List.rev (Hashtbl.find by_date_orbit (date_str, orbit)) in
-      let doy = doy_of_date_str date_str in
+    List.iter (fun group ->
+      let doy = doy_of_date_str group.sg_date in
 
-      (* For each polarisation, convert to dB per tile, then mosaic (mean where > 0) *)
-      let mosaic_pol pol_name =
-        let db_list = List.map (fun (item : Stac_client.item) ->
-          let signed_item = Stac_client.sign_planetary_computer ~sw client item in
-          match get_asset_href signed_item pol_name with
+      let mosaic_pol get_url =
+        let db_list = List.filter_map (fun tile ->
+          match get_url tile with
           | None -> None
-          | Some href ->
+          | Some url ->
             let amp = read_cog_band ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
-                        ~width:w ~height:h href in
-            Some (amplitude_to_db amp roi.mask h w)
-        ) group_items in
-        let db_list = List.filter_map Fun.id db_list in
+                        ~width:w ~height:h url in
+            let db = amplitude_to_db amp roi.mask h w in
+            let has_any = ref false in
+            Array.iter (fun row ->
+              Array.iter (fun v -> if v > 0 then has_any := true) row) db;
+            if !has_any then Some db else None
+        ) group.sg_tiles in
         if db_list = [] then None
         else begin
-          let n_tiles = List.length db_list in
           let sum = Array.init h (fun _ -> Array.make w 0.0) in
           let cnt = Array.init h (fun _ -> Array.make w 0) in
           List.iter (fun db ->
@@ -524,39 +551,32 @@ let process_s1 ~(roi : roi) ~sw ~(client : Stac_client.t) items =
               done
             done
           ) db_list;
-          ignore n_tiles;
-          (* Check if any pixel has valid data *)
-          let has_any = ref false in
-          Array.iter (fun row -> Array.iter (fun c -> if c > 0 then has_any := true) row) cnt;
-          if not !has_any then None
-          else begin
-            let out = Array.init h (fun i ->
-              Array.init w (fun j ->
-                if cnt.(i).(j) > 0
-                then Float.to_int (sum.(i).(j) /. Float.of_int cnt.(i).(j))
-                else 0)) in
-            Some out
-          end
+          let out = Array.init h (fun i ->
+            Array.init w (fun j ->
+              if cnt.(i).(j) > 0
+              then Float.to_int (sum.(i).(j) /. Float.of_int cnt.(i).(j))
+              else 0)) in
+          Some out
         end
       in
 
-      let vv_out = mosaic_pol "vv" in
-      let vh_out = mosaic_pol "vh" in
+      let vv_out = mosaic_pol (fun t -> t.st_vv) in
+      let vh_out = mosaic_pol (fun t -> t.st_vh) in
       match vv_out, vh_out with
-      | None, None -> ()  (* skip *)
+      | None, None -> ()
       | _ ->
         let vv = match vv_out with Some v -> v | None -> Array.init h (fun _ -> Array.make w 0) in
         let vh = match vh_out with Some v -> v | None -> Array.init h (fun _ -> Array.make w 0) in
         let combined = Array.init h (fun i ->
           Array.init w (fun j -> [| Float.of_int vv.(i).(j); Float.of_int vh.(i).(j) |])) in
-        if orbit = "ascending" then begin
+        if group.sg_orbit = "ascending" then begin
           asc_data := combined :: !asc_data;
           asc_doys := doy :: !asc_doys
         end else begin
           desc_data := combined :: !desc_data;
           desc_doys := doy :: !desc_doys
         end
-    ) sorted_keys;
+    ) groups;
 
     (Array.of_list (List.rev !asc_data),
      Array.of_list (List.rev !asc_doys),
@@ -796,116 +816,39 @@ let read_orbit_direction_from_cog url =
     result
   end
 
-(** Process Sentinel-1 OPERA RTC data from AWS/CMR into asc/desc arrays. *)
-let process_s1_opera ~(roi : roi) ~sw ~(client : Stac_client.t)
-    ~bbox ~datetime =
-  let h = roi.height and w = roi.width in
-  let (left, bottom, right, top) = roi.bounds in
-  let token = read_edl_token () in
-  ignore (sw, client);
-  (* Set up GDAL auth for cumulus OPERA COG access *)
-  setup_opera_gdal_auth token;
-  Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" (Some "EMPTY_DIR");
+(** Prepare Sentinel-1 groups from OPERA RTC-S1 via CMR.
+    GDAL auth must be configured before calling this. *)
+let prepare_s1_opera ~sw ~(client : Stac_client.t) ~bbox ~datetime =
   eprintf "  Searching CMR for OPERA RTC-S1...\n%!";
   let granules = search_cmr_opera ~sw ~client ~bbox ~datetime in
   eprintf "  Found %d OPERA granules\n%!" (List.length granules);
-  if granules = [] then begin
-    eprintf "  No OPERA S1 granules found\n%!";
-    ([||], [||], [||], [||])
-  end else begin
-    eprintf "  Loading OPERA SAR data...\n%!";
-    (* Group granules by date *)
+  if granules = [] then []
+  else begin
     let by_date = Hashtbl.create 64 in
     List.iter (fun g ->
       let prev = try Hashtbl.find by_date g.og_date with Not_found -> [] in
       Hashtbl.replace by_date g.og_date (g :: prev)
     ) granules;
-
-    let asc_data = ref [] in
-    let asc_doys = ref [] in
-    let desc_data = ref [] in
-    let desc_doys = ref [] in
-
     let sorted_dates = List.sort String.compare
       (Hashtbl.fold (fun k _ acc -> k :: acc) by_date []) in
+    let groups = ref [] in
     List.iter (fun date_str ->
       let day_granules = List.rev (Hashtbl.find by_date date_str) in
-      let doy = doy_of_date_str date_str in
-
-      (* Group by orbit direction — read from first granule's metadata *)
       let by_orbit = Hashtbl.create 4 in
       List.iter (fun g ->
         let orbit = read_orbit_direction_from_cog g.og_vv_url in
         let prev = try Hashtbl.find by_orbit orbit with Not_found -> [] in
         Hashtbl.replace by_orbit orbit (g :: prev)
       ) day_granules;
-
       Hashtbl.iter (fun orbit orbit_granules ->
-        (* For each granule: read VV & VH, convert to dB, mosaic *)
-        let mosaic_pol get_url =
-          let db_list = List.filter_map (fun g ->
-            let url = get_url g in
-            let amp = read_cog_band ~dst_crs_wkt:roi.crs_wkt
-              ~bounds:(left, bottom, right, top) ~width:w ~height:h url in
-            let db = amplitude_to_db amp roi.mask h w in
-            (* Check if any valid pixel *)
-            let has_any = ref false in
-            Array.iter (fun row ->
-              Array.iter (fun v -> if v > 0 then has_any := true) row) db;
-            if !has_any then Some db else None
-          ) orbit_granules in
-          if db_list = [] then None
-          else begin
-            let sum = Array.init h (fun _ -> Array.make w 0.0) in
-            let cnt = Array.init h (fun _ -> Array.make w 0) in
-            List.iter (fun db ->
-              for i = 0 to h - 1 do
-                for j = 0 to w - 1 do
-                  if db.(i).(j) > 0 then begin
-                    sum.(i).(j) <- sum.(i).(j) +. Float.of_int db.(i).(j);
-                    cnt.(i).(j) <- cnt.(i).(j) + 1
-                  end
-                done
-              done
-            ) db_list;
-            let out = Array.init h (fun i ->
-              Array.init w (fun j ->
-                if cnt.(i).(j) > 0
-                then Float.to_int (sum.(i).(j) /. Float.of_int cnt.(i).(j))
-                else 0)) in
-            Some out
-          end
-        in
-
-        let vv_out = mosaic_pol (fun g -> g.og_vv_url) in
-        let vh_out = mosaic_pol (fun g -> g.og_vh_url) in
-        match vv_out, vh_out with
-        | None, None -> ()
-        | _ ->
-          let vv = match vv_out with Some v -> v
-            | None -> Array.init h (fun _ -> Array.make w 0) in
-          let vh = match vh_out with Some v -> v
-            | None -> Array.init h (fun _ -> Array.make w 0) in
-          let combined = Array.init h (fun i ->
-            Array.init w (fun j ->
-              [| Float.of_int vv.(i).(j); Float.of_int vh.(i).(j) |])) in
-          if orbit = "ascending" then begin
-            asc_data := combined :: !asc_data;
-            asc_doys := doy :: !asc_doys
-          end else begin
-            desc_data := combined :: !desc_data;
-            desc_doys := doy :: !desc_doys
-          end
+        let tiles = List.map (fun g ->
+          { st_vv = Some g.og_vv_url;
+            st_vh = Some g.og_vh_url }
+        ) orbit_granules in
+        groups := { sg_date = date_str; sg_orbit = orbit; sg_tiles = tiles } :: !groups
       ) by_orbit
     ) sorted_dates;
-
-    (* Clean up GDAL auth state *)
-    Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" None;
-    Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" None;
-    (Array.of_list (List.rev !asc_data),
-     Array.of_list (List.rev !asc_doys),
-     Array.of_list (List.rev !desc_data),
-     Array.of_list (List.rev !desc_doys))
+    List.rev !groups
   end
 
 (* ======================== Main pipeline ======================== *)
@@ -1074,7 +1017,7 @@ let () =
 
     Printf.printf "\nSearching Sentinel-1 [%s] (%s)...\n%!"
       (match data_source with MPC -> "MPC" | AWS -> "AWS/OPERA") date_range;
-    let (s1a, s1ad, s1de, s1dd) = match data_source with
+    let s1_groups = match data_source with
       | MPC ->
         let s1_params : Stac_client.search_params = {
           collections = ["sentinel-1-rtc"];
@@ -1085,13 +1028,17 @@ let () =
         } in
         let s1_items = Stac_client.search ~sw client ~base_url:stac_url s1_params in
         Printf.printf "  Found %d scenes\n%!" (List.length s1_items);
-        Printf.printf "Processing Sentinel-1...\n%!";
-        process_s1 ~roi ~sw ~client s1_items
+        prepare_s1_mpc ~sw ~client s1_items
       | AWS ->
-        Printf.printf "Processing Sentinel-1 (OPERA RTC)...\n%!";
-        process_s1_opera ~roi ~sw ~client
+        let token = read_edl_token () in
+        setup_opera_gdal_auth token;
+        prepare_s1_opera ~sw ~client
           ~bbox:(xmin, ymin, xmax, ymax) ~datetime:date_range
     in
+    Printf.printf "Processing Sentinel-1 (%d groups)...\n%!" (List.length s1_groups);
+    let (s1a, s1ad, s1de, s1dd) = process_s1_groups ~roi s1_groups in
+    (if data_source = AWS then
+      Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" None);
     s1_asc_data := flatten_4d s1a;
     s1_asc_doy_data := s1ad;
     s1_desc_data := flatten_4d s1de;
