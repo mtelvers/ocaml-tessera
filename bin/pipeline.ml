@@ -282,7 +282,7 @@ let gdal_vsi_path url =
 
 let warp_id = Atomic.make 0
 
-let warp_to_mem ~dst_crs_wkt ~bounds:(left, bottom, right, top)
+let warp_to_mem ?(resampling="near") ~dst_crs_wkt ~bounds:(left, bottom, right, top)
     ~width ~height url =
   let id = Atomic.fetch_and_add warp_id 1 in
   let dst = Printf.sprintf "/vsimem/warp_%d" id in
@@ -298,15 +298,15 @@ let warp_to_mem ~dst_crs_wkt ~bounds:(left, bottom, right, top)
              Printf.sprintf "%.15g" right;
              Printf.sprintf "%.15g" top;
       "-ts"; string_of_int width; string_of_int height;
-      "-r"; "near";
+      "-r"; resampling;
       "-of"; "MEM";
     ] in
     let result = Gdal.Dataset.warp src ~dst_filename:dst opts in
     Gdal.Dataset.close src;
     result
 
-let read_cog_band ~dst_crs_wkt ~bounds ~width ~height url =
-  match warp_to_mem ~dst_crs_wkt ~bounds ~width ~height url with
+let read_cog_band ?(resampling="near") ~dst_crs_wkt ~bounds ~width ~height url =
+  match warp_to_mem ~resampling ~dst_crs_wkt ~bounds ~width ~height url with
   | Error _ ->
     eprintf "Warning: warp failed for %s\n%!" url;
     Array.make (height * width) 0.0
@@ -578,7 +578,7 @@ let process_s1_groups ~(roi : roi) ~n_workers groups =
           match get_url tile with
           | None -> None
           | Some url ->
-            let amp = read_cog_band ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
+            let amp = read_cog_band ~resampling:"bilinear" ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
                         ~width:w ~height:h url in
             let db = amplitude_to_db amp roi.mask h w in
             let has_any = ref false in
