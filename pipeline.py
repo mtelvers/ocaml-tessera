@@ -266,14 +266,25 @@ def process_s1(items, crs, bounds, resolution, height, width, roi_mask=None):
 
     print("  Loading SAR data...")
     sar_lazy = _stack(items, ["vv", "vh"], crs, bounds, resolution)
-    sar_all = sar_lazy.compute().values  # (N_items, 2, H', W')
+    sar_all = sar_lazy.compute().values  # (N_times, 2, H', W')
     H_out, W_out = sar_all.shape[2], sar_all.shape[3]
 
+    # Build index mapping from stackstac's time coordinate (which may reorder items)
+    stack_times = sar_lazy.coords["time"].values
+    time_to_indices = {}
+    for idx, t in enumerate(stack_times):
+        day_str = str(np.datetime64(t, "D"))
+        time_to_indices.setdefault(day_str, []).append(idx)
+
     by_date_orbit = {}
-    for i, item in enumerate(items):
+    for item in items:
         date_str = item.datetime.strftime("%Y-%m-%d")
         orbit = orbit_lookup[item.id]
-        by_date_orbit.setdefault((date_str, orbit), []).append(i)
+        by_date_orbit.setdefault((date_str, orbit), None)
+
+    # Map each (date, orbit) group to stackstac indices via time coordinate
+    for (date_str, orbit) in by_date_orbit:
+        by_date_orbit[(date_str, orbit)] = time_to_indices.get(date_str, [])
 
     asc_data, asc_doys = [], []
     desc_data, desc_doys = [], []

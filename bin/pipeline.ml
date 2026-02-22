@@ -77,6 +77,12 @@ let get_asset_href (item : Stac_client.item) key =
 (** Printf to stderr for progress *)
 let eprintf fmt = Printf.eprintf fmt
 
+let rec mkdir_p dir =
+  if dir <> "/" && dir <> "." && not (Sys.file_exists dir) then begin
+    mkdir_p (Filename.dirname dir);
+    (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+  end
+
 (* ======================== Flat bigarray types ======================== *)
 
 (** Flat 4D array: [n_dates][height][width][channels] as contiguous float bigarray.
@@ -154,21 +160,22 @@ type roi = {
 }
 
 let load_roi tiff_path =
-  let ds = Gdal.Dataset.open' tiff_path Gdal_c.C.Type.Access.RO in
+  Gdal.init ();
+  let ds = Gdal.Dataset.open_ tiff_path |> Result.get_ok in
   let h = Gdal.Dataset.raster_y_size ds in
   let w = Gdal.Dataset.raster_x_size ds in
-  let band = Gdal.Dataset.raster_band ds 1 |> Option.get in
-  let data = Gdal.RasterBand.read ~x_off:0 ~y_off:0 ~x_size:w ~y_size:h
-               ~buf_x_size:w ~buf_y_size:h band |> Result.get_ok in
+  let band = Gdal.Dataset.get_band ds 1 |> Result.get_ok in
+  let data = Gdal.RasterBand.read_region Gdal.BA_float64 band
+               ~x_off:0 ~y_off:0 ~x_size:w ~y_size:h
+               ~buf_x:w ~buf_y:h |> Result.get_ok in
   let mask = Array.init h (fun i ->
     Array.init w (fun j ->
-      if Array1.get data (i * w + j) > 0.0 then 1 else 0)) in
-  let gt = Gdal.Dataset.geo_transform ds |> Result.get_ok in
-  (* gt: [0]=originX, [1]=pixelWidth, [2]=0, [3]=originY, [4]=0, [5]=pixelHeight (negative) *)
-  let left = Array1.get gt 0 in
-  let pixel_w = Array1.get gt 1 in
-  let top = Array1.get gt 3 in
-  let pixel_h = Array1.get gt 5 in  (* negative *)
+      if Array2.get data i j > 0.0 then 1 else 0)) in
+  let gt = Gdal.Dataset.get_geo_transform ds |> Result.get_ok in
+  let left = gt.origin_x in
+  let pixel_w = gt.pixel_width in
+  let top = gt.origin_y in
+  let pixel_h = gt.pixel_height in  (* negative *)
   let right = left +. (Float.of_int w *. pixel_w) in
   let bottom = top +. (Float.of_int h *. pixel_h) in
   let resolution = Float.abs pixel_w in
@@ -181,6 +188,7 @@ let load_roi tiff_path =
     Gdal.CoordinateTransformation.transform_bounds ct
       ~xmin:(Float.min left right) ~ymin:(Float.min bottom top)
       ~xmax:(Float.max left right) ~ymax:(Float.max bottom top)
+      ~density:21
     |> Result.get_ok
   in
   Gdal.CoordinateTransformation.destroy ct;
@@ -237,6 +245,31 @@ let flatten_3d_int (arr : int array array array) =
     done;
     { idata; n3 = n; h3 = h; w3 = w }
 
+(* ======================== Parallel map ======================== *)
+
+let parallel_map ~n_workers f items =
+  let n = Array.length items in
+  if n = 0 || n_workers <= 1 then Array.map (fun x -> Some (f x)) items
+  else begin
+    let results = Array.make n None in
+    let next = Atomic.make 0 in
+    let actual = min n_workers n in
+    let domains = Array.init actual (fun _ ->
+      Domain.spawn (fun () ->
+        let rec loop () =
+          let i = Atomic.fetch_and_add next 1 in
+          if i < n then begin
+            results.(i) <- (try Some (f items.(i)) with exn ->
+              Printf.eprintf "Warning: parallel task %d failed: %s\n%!" i
+                (Printexc.to_string exn); None);
+            loop ()
+          end
+        in loop ())
+    ) in
+    Array.iter Domain.join domains;
+    results
+  end
+
 (* ======================== COG reading via GDAL warp ======================== *)
 
 (** Convert a URL to a GDAL virtual filesystem path.
@@ -247,20 +280,30 @@ let gdal_vsi_path url =
   else
     "/vsicurl/" ^ url
 
+let warp_id = Atomic.make 0
+
 let warp_to_mem ~dst_crs_wkt ~bounds:(left, bottom, right, top)
     ~width ~height url =
-  let src = Gdal.Dataset.open_ex (gdal_vsi_path url) in
-  let opts = [
-    "-t_srs"; dst_crs_wkt;
-    "-te"; Printf.sprintf "%.15g" left;
-           Printf.sprintf "%.15g" bottom;
-           Printf.sprintf "%.15g" right;
-           Printf.sprintf "%.15g" top;
-    "-ts"; string_of_int width; string_of_int height;
-    "-r"; "near";
-    "-of"; "MEM";
-  ] in
-  Gdal.Dataset.warp ~options:opts ~src "/vsimem/tmp_warp"
+  let id = Atomic.fetch_and_add warp_id 1 in
+  let dst = Printf.sprintf "/vsimem/warp_%d" id in
+  match Gdal.Dataset.open_ex (gdal_vsi_path url) with
+  | Error msg ->
+    eprintf "Warning: open failed for %s: %s\n%!" url msg;
+    Error msg
+  | Ok src ->
+    let opts = [
+      "-t_srs"; dst_crs_wkt;
+      "-te"; Printf.sprintf "%.15g" left;
+             Printf.sprintf "%.15g" bottom;
+             Printf.sprintf "%.15g" right;
+             Printf.sprintf "%.15g" top;
+      "-ts"; string_of_int width; string_of_int height;
+      "-r"; "near";
+      "-of"; "MEM";
+    ] in
+    let result = Gdal.Dataset.warp src ~dst_filename:dst opts in
+    Gdal.Dataset.close src;
+    result
 
 let read_cog_band ~dst_crs_wkt ~bounds ~width ~height url =
   match warp_to_mem ~dst_crs_wkt ~bounds ~width ~height url with
@@ -268,13 +311,15 @@ let read_cog_band ~dst_crs_wkt ~bounds ~width ~height url =
     eprintf "Warning: warp failed for %s\n%!" url;
     Array.make (height * width) 0.0
   | Ok warped ->
-    let band = Gdal.Dataset.raster_band warped 1 |> Option.get in
-    let w_out = Gdal.RasterBand.x_size band in
-    let h_out = Gdal.RasterBand.y_size band in
-    match Gdal.RasterBand.read ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out
-            ~buf_x_size:w_out ~buf_y_size:h_out band with
+    let band = Gdal.Dataset.get_band warped 1 |> Result.get_ok in
+    let w_out = Gdal.RasterBand.x_size band |> Result.get_ok in
+    let h_out = Gdal.RasterBand.y_size band |> Result.get_ok in
+    match Gdal.RasterBand.read_region Gdal.BA_float64 band
+            ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out
+            ~buf_x:w_out ~buf_y:h_out with
     | Ok ba ->
-      let arr = Array.init (h_out * w_out) (fun i -> Array1.get ba i) in
+      let arr = Array.init (h_out * w_out) (fun i ->
+        Array2.get ba (i / w_out) (i mod w_out)) in
       Gdal.Dataset.close warped; arr
     | Error _ ->
       eprintf "Warning: band read failed for %s\n%!" url;
@@ -287,13 +332,14 @@ let read_cog_band_byte ~dst_crs_wkt ~bounds ~width ~height url =
     eprintf "Warning: warp failed for %s\n%!" url;
     Array.make (height * width) 0
   | Ok warped ->
-    let band = Gdal.Dataset.raster_band warped 1 |> Option.get in
-    let w_out = Gdal.RasterBand.x_size band in
-    let h_out = Gdal.RasterBand.y_size band in
-    match Gdal.RasterBand.read_byte ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out
-            ~buf_x_size:w_out ~buf_y_size:h_out band with
+    let band = Gdal.Dataset.get_band warped 1 |> Result.get_ok in
+    let w_out = Gdal.RasterBand.x_size band |> Result.get_ok in
+    let h_out = Gdal.RasterBand.y_size band |> Result.get_ok in
+    match Gdal.RasterBand.read_byte band
+            ~x_off:0 ~y_off:0 ~x_size:w_out ~y_size:h_out with
     | Ok ba ->
-      let arr = Array.init (h_out * w_out) (fun i -> Array1.get ba i) in
+      let arr = Array.init (h_out * w_out) (fun i ->
+        Array2.get ba (i / w_out) (i mod w_out)) in
       Gdal.Dataset.close warped; arr
     | Error _ ->
       eprintf "Warning: band read failed for %s\n%!" url;
@@ -304,7 +350,7 @@ let read_cog_band_byte ~dst_crs_wkt ~bounds ~width ~height url =
 
 (** Process Sentinel-2 items: SCL cloud masking, smart mosaic, harmonisation.
     Returns (bands[n_dates][H][W][10], masks[n_dates][H][W], doys[n_dates]) *)
-let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
+let process_s2 ~(roi : roi) ~(client : Stac_client.t) ~data_source ~n_workers items =
   let h = roi.height and w = roi.width in
   let (left, bottom, right, top) = roi.bounds in
   if items = [] then begin
@@ -322,22 +368,26 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
     let roi_total = Array.fold_left (fun acc row ->
       acc + Array.fold_left ( + ) 0 row) 0 roi.mask in
 
-    (* For each item, load SCL band *)
+    (* Pre-sign all items *)
+    let signed_items = Array.map (fun item -> match data_source with
+      | MPC -> Stac_client.sign_planetary_computer client item
+      | AWS -> item) items_arr in
+
+    (* For each item, load SCL band (parallel) *)
     let n_items = Array.length items_arr in
-    let scl_data = Array.init n_items (fun i ->
-      let item = items_arr.(i) in
-      let access_item = match data_source with
-        | MPC -> Stac_client.sign_planetary_computer ~sw client item
-        | AWS -> item
-      in
+    let scl_results = parallel_map ~n_workers (fun i ->
+      let access_item = signed_items.(i) in
       match get_asset_href access_item (scl_asset_name data_source) with
       | None ->
-        eprintf "  Warning: item %s has no SCL asset\n%!" item.id;
+        eprintf "  Warning: item %s has no SCL asset\n%!" items_arr.(i).id;
         Array.make (h * w) 0
       | Some href ->
         read_cog_band_byte ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
           ~width:w ~height:h href
-    ) in
+    ) (Array.init n_items Fun.id) in
+    let scl_data = Array.map (fun opt -> match opt with
+      | Some d -> d
+      | None -> Array.make (h * w) 0) scl_results in
 
     (* For each date, build tile_selection *)
     let valid_dates = ref [] in
@@ -389,13 +439,10 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
     if valid_dates = [] then
       ([||], [||], [||])
     else begin
-      (* --- Pass 2: Spectral bands --- *)
+      (* --- Pass 2: Spectral bands (parallel per date) --- *)
       eprintf "  Loading spectral bands...\n%!";
-      let all_bands = ref [] in
-      let all_masks = ref [] in
-      let all_doys = ref [] in
-
-      List.iter (fun date_str ->
+      let valid_dates_arr = Array.of_list valid_dates in
+      let date_results = parallel_map ~n_workers (fun date_str ->
         let doy = doy_of_date_str date_str in
         let tile_sel = Hashtbl.find day_tile_sel date_str in
         (* Find items for this date *)
@@ -403,13 +450,9 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
         Array.iteri (fun i d -> if d = date_str then indices := i :: !indices) item_dates;
         let indices = List.rev !indices in
 
-        (* Load and sign band COGs for each tile *)
+        (* Load band COGs for each tile (using pre-signed items) *)
         let tile_band_data = List.map (fun item_idx ->
-          let item = items_arr.(item_idx) in
-          let access_item = match data_source with
-            | MPC -> Stac_client.sign_planetary_computer ~sw client item
-            | AWS -> item
-          in
+          let access_item = signed_items.(item_idx) in
           Array.map (fun band_name ->
             match get_asset_href access_item band_name with
             | None -> Array.make (h * w) 0.0
@@ -450,10 +493,20 @@ let process_s2 ~(roi : roi) ~sw ~(client : Stac_client.t) ~data_source items =
           Array.init w (fun j ->
             if tile_sel.(i).(j) >= 0 then 1 else 0)) in
 
-        all_bands := out_bands :: !all_bands;
-        all_masks := out_mask :: !all_masks;
-        all_doys := doy :: !all_doys
-      ) valid_dates;
+        (out_bands, out_mask, doy)
+      ) valid_dates_arr in
+
+      (* Collect results, skipping failures *)
+      let all_bands = ref [] in
+      let all_masks = ref [] in
+      let all_doys = ref [] in
+      Array.iter (fun opt -> match opt with
+        | Some (bands, mask, doy) ->
+          all_bands := bands :: !all_bands;
+          all_masks := mask :: !all_masks;
+          all_doys := doy :: !all_doys
+        | None -> ()
+      ) date_results;
 
       (Array.of_list (List.rev !all_bands),
        Array.of_list (List.rev !all_masks),
@@ -482,7 +535,7 @@ let amplitude_to_db amp_arr mask_arr h w =
 
 (** Prepare Sentinel-1 groups from MPC STAC items.
     Signs each item and extracts VV/VH asset hrefs. *)
-let prepare_s1_mpc ~sw ~(client : Stac_client.t) items =
+let prepare_s1_mpc ~(client : Stac_client.t) items =
   if items = [] then []
   else begin
     let by_date_orbit = Hashtbl.create 64 in
@@ -498,7 +551,7 @@ let prepare_s1_mpc ~sw ~(client : Stac_client.t) items =
     List.map (fun (date_str, orbit) ->
       let group_items = List.rev (Hashtbl.find by_date_orbit (date_str, orbit)) in
       let tiles = List.map (fun (item : Stac_client.item) ->
-        let signed = Stac_client.sign_planetary_computer ~sw client item in
+        let signed = Stac_client.sign_planetary_computer client item in
         { st_vv = get_asset_href signed "vv";
           st_vh = get_asset_href signed "vh" }
       ) group_items in
@@ -508,7 +561,7 @@ let prepare_s1_mpc ~sw ~(client : Stac_client.t) items =
 
 (** Process prepared S1 groups into ascending/descending arrays.
     Common processing for both MPC and OPERA data sources. *)
-let process_s1_groups ~(roi : roi) groups =
+let process_s1_groups ~(roi : roi) ~n_workers groups =
   let h = roi.height and w = roi.width in
   let (left, bottom, right, top) = roi.bounds in
   if groups = [] then begin
@@ -516,12 +569,8 @@ let process_s1_groups ~(roi : roi) groups =
     ([||], [||], [||], [||])
   end else begin
     eprintf "  Loading SAR data (%d groups)...\n%!" (List.length groups);
-    let asc_data = ref [] in
-    let asc_doys = ref [] in
-    let desc_data = ref [] in
-    let desc_doys = ref [] in
 
-    List.iter (fun group ->
+    let group_results = parallel_map ~n_workers (fun group ->
       let doy = doy_of_date_str group.sg_date in
 
       let mosaic_pol get_url =
@@ -563,25 +612,57 @@ let process_s1_groups ~(roi : roi) groups =
       let vv_out = mosaic_pol (fun t -> t.st_vv) in
       let vh_out = mosaic_pol (fun t -> t.st_vh) in
       match vv_out, vh_out with
-      | None, None -> ()
+      | None, None -> None
       | _ ->
         let vv = match vv_out with Some v -> v | None -> Array.init h (fun _ -> Array.make w 0) in
         let vh = match vh_out with Some v -> v | None -> Array.init h (fun _ -> Array.make w 0) in
         let combined = Array.init h (fun i ->
           Array.init w (fun j -> [| Float.of_int vv.(i).(j); Float.of_int vh.(i).(j) |])) in
-        if group.sg_orbit = "ascending" then begin
+        Some (group.sg_orbit, doy, combined)
+    ) (Array.of_list groups) in
+
+    (* Partition into ascending/descending *)
+    let asc_data = ref [] in
+    let asc_doys = ref [] in
+    let desc_data = ref [] in
+    let desc_doys = ref [] in
+    Array.iter (fun opt -> match opt with
+      | Some (Some (orbit, doy, combined)) ->
+        if orbit = "ascending" then begin
           asc_data := combined :: !asc_data;
           asc_doys := doy :: !asc_doys
         end else begin
           desc_data := combined :: !desc_data;
           desc_doys := doy :: !desc_doys
         end
-    ) groups;
+      | _ -> ()
+    ) group_results;
 
+    let desc_data_arr = Array.of_list (List.rev !desc_data) in
+    let desc_doys_arr = Array.of_list (List.rev !desc_doys) in
+    (* DIAGNOSTIC: check alignment of data and DOYs *)
+    let nd = Array.length desc_data_arr in
+    if nd > 0 then begin
+      eprintf "  DIAG: %d desc dates, DOYs=[%d..%d]\n%!" nd
+        desc_doys_arr.(0) desc_doys_arr.(nd - 1);
+      for d = 0 to min 3 (nd - 1) do
+        let nz = ref 0 in
+        Array.iter (fun row -> Array.iter (fun col ->
+          if col.(0) > 0.0 then incr nz) row) desc_data_arr.(d);
+        eprintf "  DIAG: desc[%d] doy=%d nonzero=%d\n%!" d desc_doys_arr.(d) !nz
+      done;
+      if nd > 4 then begin
+        let d = nd - 1 in
+        let nz = ref 0 in
+        Array.iter (fun row -> Array.iter (fun col ->
+          if col.(0) > 0.0 then incr nz) row) desc_data_arr.(d);
+        eprintf "  DIAG: desc[%d] doy=%d nonzero=%d\n%!" d desc_doys_arr.(d) !nz
+      end
+    end;
     (Array.of_list (List.rev !asc_data),
      Array.of_list (List.rev !asc_doys),
-     Array.of_list (List.rev !desc_data),
-     Array.of_list (List.rev !desc_doys))
+     desc_data_arr,
+     desc_doys_arr)
   end
 
 (* ======================== Flat sampling (zero-allocation hot path) ======================== *)
@@ -721,7 +802,7 @@ let setup_opera_gdal_auth token =
   let oc = open_out header_path in
   Printf.fprintf oc "Authorization: Bearer %s\nCookie: asf-urs=%s\n" token token;
   close_out oc;
-  Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" (Some header_path);
+  Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" header_path;
   eprintf "  GDAL OPERA auth configured\n%!"
 
 
@@ -732,7 +813,7 @@ type opera_granule = {
 }
 
 (** Search CMR for OPERA RTC-S1 granules. *)
-let search_cmr_opera ~sw ~(client : Stac_client.t)
+let search_cmr_opera ~(client : Stac_client.t)
     ~bbox:(xmin, ymin, xmax, ymax) ~datetime =
   let temporal =
     match String.split_on_char '/' datetime with
@@ -747,10 +828,9 @@ let search_cmr_opera ~sw ~(client : Stac_client.t)
       "%s?collection_concept_id=%s&bounding_box=%s&temporal=%s&page_size=2000&page_num=%d"
       cmr_url opera_collection_id bbox_str temporal page_num
     in
-    let resp, body = Stac_client.http_get ~sw client url in
-    if Http.Status.compare resp.status `OK <> 0 then
-      failwith (Printf.sprintf "CMR search failed (%s): %s"
-        (Http.Status.to_string resp.status) body);
+    let code, body = Stac_client.http_get client url in
+    if code <> 200 then
+      failwith (Printf.sprintf "CMR search failed (%d): %s" code body);
     let json = Yojson.Safe.from_string body in
     let entries = match json with
       | `Assoc fields ->
@@ -799,28 +879,24 @@ let search_cmr_opera ~sw ~(client : Stac_client.t)
 
 (** Read orbit direction from a GDAL dataset's metadata tags. *)
 let read_orbit_direction_from_cog url =
-  let ds = Gdal.Dataset.open_ex (gdal_vsi_path url) in
-  if Gdal.Dataset.is_null ds then begin
+  match Gdal.Dataset.open_ex (gdal_vsi_path url) with
+  | Error _ ->
     eprintf "  Warning: could not open COG for orbit metadata\n%!";
     "unknown"
-  end else begin
+  | Ok ds ->
     let result =
-      match Gdal.Dataset.get_metadata_item ds "ORBIT_PASS_DIRECTION" None with
+      match Gdal.Dataset.get_metadata_item ds ~key:"ORBIT_PASS_DIRECTION" ~domain:"" with
       | Some s -> String.lowercase_ascii s
-      | None ->
-        match Gdal.Dataset.get_metadata_item ds "ORBIT_PASS_DIRECTION" (Some "") with
-        | Some s -> String.lowercase_ascii s
-        | None -> "unknown"
+      | None -> "unknown"
     in
     Gdal.Dataset.close ds;
     result
-  end
 
 (** Prepare Sentinel-1 groups from OPERA RTC-S1 via CMR.
     GDAL auth must be configured before calling this. *)
-let prepare_s1_opera ~sw ~(client : Stac_client.t) ~bbox ~datetime =
+let prepare_s1_opera ~(client : Stac_client.t) ~bbox ~datetime =
   eprintf "  Searching CMR for OPERA RTC-S1...\n%!";
-  let granules = search_cmr_opera ~sw ~client ~bbox ~datetime in
+  let granules = search_cmr_opera ~client ~bbox ~datetime in
   eprintf "  Found %d OPERA granules\n%!" (List.length granules);
   if granules = [] then []
   else begin
@@ -869,6 +945,7 @@ let () =
   let download_only = ref false in
   let cuda_device = ref (-1) in
   let data_source_str = ref "mpc" in
+  let download_workers = ref 8 in
 
   let speclist = [
     ("--input_tiff", Arg.Set_string input_tiff, "Path to grid GeoTIFF");
@@ -885,6 +962,7 @@ let () =
     ("--download_only", Arg.Set download_only, "Only download, skip inference");
     ("--cuda", Arg.Set_int cuda_device, "CUDA device ID (e.g. 0) for GPU inference");
     ("--data_source", Arg.Set_string data_source_str, "Data source: mpc or aws (default: mpc)");
+    ("--download_workers", Arg.Set_int download_workers, "Parallel GDAL download workers (default: 8)");
   ] in
   Arg.parse speclist (fun _ -> ()) "Minimal OCaml Tessera pipeline";
 
@@ -977,26 +1055,24 @@ let () =
       (!s1_desc_data).n
   end else begin
     (* Download via STAC + GDAL *)
-    Eio_main.run @@ fun env ->
-    Mirage_crypto_rng_unix.use_default ();
-    Eio.Switch.run @@ fun sw ->
-    let net = Eio.Stdenv.net env in
-    let client = Stac_client.make net in
+    let n_workers = !download_workers in
+    let client = Stac_client.make () in
     let roi = load_roi !input_tiff in
     Printf.printf "  Tile: %dx%d, resolution=%.6f\n%!" roi.height roi.width roi.resolution;
     let (xmin, ymin, xmax, ymax) = roi.bbox in
 
     (* Set GDAL COG optimization for AWS sources *)
     if data_source = AWS then begin
-      Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" (Some "EMPTY_DIR");
-      Gdal.set_config_option "GDAL_HTTP_MULTIRANGE" (Some "YES");
-      Gdal.set_config_option "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES" (Some "YES");
+      Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" "EMPTY_DIR";
+      Gdal.set_config_option "GDAL_HTTP_MULTIRANGE" "YES";
+      Gdal.set_config_option "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES" "YES";
     end;
 
     let s2_base_url = match data_source with
       | MPC -> stac_url
       | AWS -> aws_stac_url
     in
+    let t_s2_start = Unix.gettimeofday () in
     Printf.printf "\nSearching Sentinel-2 [%s] (%s)...\n%!"
       (match data_source with MPC -> "MPC" | AWS -> "AWS") date_range;
     let s2_params : Stac_client.search_params = {
@@ -1006,15 +1082,17 @@ let () =
       query = Some (`Assoc ["eo:cloud_cover", `Assoc ["lt", `Float !max_cloud]]);
       limit = None;
     } in
-    let s2_items = Stac_client.search ~sw client ~base_url:s2_base_url s2_params in
+    let s2_items = Stac_client.search client ~base_url:s2_base_url s2_params in
     Printf.printf "  Found %d scenes\n%!" (List.length s2_items);
-    Printf.printf "Processing Sentinel-2...\n%!";
-    let (s2b, s2m, s2d) = process_s2 ~roi ~sw ~client ~data_source s2_items in
+    Printf.printf "Processing Sentinel-2 (workers=%d)...\n%!" n_workers;
+    let (s2b, s2m, s2d) = process_s2 ~roi ~client ~data_source ~n_workers s2_items in
     s2_bands_data := flatten_4d s2b;
     s2_masks_data := flatten_3d_int s2m;
     s2_doys_data := s2d;
-    Printf.printf "  Result: %d valid days\n%!" (Array.length s2b);
+    let t_s2_end = Unix.gettimeofday () in
+    Printf.printf "  Result: %d valid days (%.1fs)\n%!" (Array.length s2b) (t_s2_end -. t_s2_start);
 
+    let t_s1_start = Unix.gettimeofday () in
     Printf.printf "\nSearching Sentinel-1 [%s] (%s)...\n%!"
       (match data_source with MPC -> "MPC" | AWS -> "AWS/OPERA") date_range;
     let s1_groups = match data_source with
@@ -1026,30 +1104,31 @@ let () =
           query = None;
           limit = None;
         } in
-        let s1_items = Stac_client.search ~sw client ~base_url:stac_url s1_params in
+        let s1_items = Stac_client.search client ~base_url:stac_url s1_params in
         Printf.printf "  Found %d scenes\n%!" (List.length s1_items);
-        prepare_s1_mpc ~sw ~client s1_items
+        prepare_s1_mpc ~client s1_items
       | AWS ->
         let token = read_edl_token () in
         setup_opera_gdal_auth token;
-        prepare_s1_opera ~sw ~client
+        prepare_s1_opera ~client
           ~bbox:(xmin, ymin, xmax, ymax) ~datetime:date_range
     in
-    Printf.printf "Processing Sentinel-1 (%d groups)...\n%!" (List.length s1_groups);
-    let (s1a, s1ad, s1de, s1dd) = process_s1_groups ~roi s1_groups in
+    Printf.printf "Processing Sentinel-1 (%d groups, workers=%d)...\n%!" (List.length s1_groups) n_workers;
+    let (s1a, s1ad, s1de, s1dd) = process_s1_groups ~roi ~n_workers s1_groups in
     (if data_source = AWS then
-      Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" None);
+      Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" "");
     s1_asc_data := flatten_4d s1a;
     s1_asc_doy_data := s1ad;
     s1_desc_data := flatten_4d s1de;
     s1_desc_doy_data := s1dd;
-    Printf.printf "  Ascending: %d passes, Descending: %d passes\n%!"
-      (Array.length s1a) (Array.length s1de);
+    let t_s1_end = Unix.gettimeofday () in
+    Printf.printf "  Ascending: %d passes, Descending: %d passes (%.1fs)\n%!"
+      (Array.length s1a) (Array.length s1de) (t_s1_end -. t_s1_start);
 
     (* Save to cache if requested *)
     if !dpixel_save_dir <> "" then begin
       let d = !dpixel_save_dir in
-      (try Unix.mkdir d 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+      mkdir_p d;
       Printf.printf "\nSaving preprocessed data to %s\n%!" d;
       let save_flat_4d path (f : flat_4d) =
         let total = f.n * f.h * f.w * f.c in
@@ -1240,13 +1319,13 @@ let () =
 
       (* Run ONNX inference — batched, using C-cached names *)
       let outputs = Onnxruntime.Session.run_cached_ba session
-        [(s2_ba,
-          [| Int64.of_int actual_b; Int64.of_int sample_size_s2; 11L |]);
-         (s1_ba,
-          [| Int64.of_int actual_b; Int64.of_int sample_size_s1; 3L |])]
-        ~output_shapes:[[| actual_b * latent_dim |]]
+        [|(s2_ba,
+           [| Int64.of_int actual_b; Int64.of_int sample_size_s2; 11L |]);
+          (s1_ba,
+           [| Int64.of_int actual_b; Int64.of_int sample_size_s1; 3L |])|]
+        ~output_sizes:[| actual_b * latent_dim |]
       in
-      let output_ba = List.hd outputs in
+      let output_ba = outputs.(0) in
 
       (* Accumulate results *)
       for px_in_batch = 0 to actual_b - 1 do
@@ -1290,12 +1369,6 @@ let () =
     (String.make 60 '=') (String.make 60 '=');
 
   (* Create output directory *)
-  let rec mkdir_p dir =
-    if dir <> "/" && dir <> "." && not (Sys.file_exists dir) then begin
-      mkdir_p (Filename.dirname dir);
-      Unix.mkdir dir 0o755
-    end
-  in
   mkdir_p !output_dir;
 
   (* Save embeddings as int8 npy [H_actual, W_actual, LATENT_DIM] *)
