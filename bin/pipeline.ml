@@ -588,23 +588,17 @@ let process_s1_groups ~(roi : roi) ~n_workers groups =
         ) group.sg_tiles in
         if db_list = [] then None
         else begin
-          let sum = Array.init h (fun _ -> Array.make w 0.0) in
-          let cnt = Array.init h (fun _ -> Array.make w 0) in
+          (* "last valid pixel" mosaic — matches rasterio.merge "first"
+             when our tile order is reversed vs Frank's *)
+          let out = Array.init h (fun _ -> Array.make w 0) in
           List.iter (fun db ->
             for i = 0 to h - 1 do
               for j = 0 to w - 1 do
-                if db.(i).(j) > 0 then begin
-                  sum.(i).(j) <- sum.(i).(j) +. Float.of_int db.(i).(j);
-                  cnt.(i).(j) <- cnt.(i).(j) + 1
-                end
+                if db.(i).(j) > 0 then
+                  out.(i).(j) <- db.(i).(j)
               done
             done
           ) db_list;
-          let out = Array.init h (fun i ->
-            Array.init w (fun j ->
-              if cnt.(i).(j) > 0
-              then Float.to_int (sum.(i).(j) /. Float.of_int cnt.(i).(j))
-              else 0)) in
           Some out
         end
       in
