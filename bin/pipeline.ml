@@ -286,7 +286,7 @@ let warp_to_mem ?(resampling="near") ~dst_crs_wkt ~bounds:(left, bottom, right, 
     ~width ~height url =
   let id = Atomic.fetch_and_add warp_id 1 in
   let dst = Printf.sprintf "/vsimem/warp_%d" id in
-  match Gdal.Dataset.open_ex (gdal_vsi_path url) with
+  match Gdal.Dataset.open_ex ~thread_safe:true (gdal_vsi_path url) with
   | Error msg ->
     eprintf "Warning: open failed for %s: %s\n%!" url msg;
     Error msg
@@ -560,10 +560,13 @@ let prepare_s1_mpc ~(client : Stac_client.t) items =
   end
 
 (** Process prepared S1 groups into ascending/descending arrays.
-    Common processing for both MPC and OPERA data sources. *)
-let process_s1_groups ~(roi : roi) ~n_workers groups =
+    Strategy differs by data source to match Frank's pipelines:
+    - MPC: nearest resampling + mean mosaic (sentinel-1-rtc is 10m native)
+    - AWS: bilinear resampling + last-valid mosaic (OPERA RTC-S1 is 30m) *)
+let process_s1_groups ~(roi : roi) ~n_workers ~data_source groups =
   let h = roi.height and w = roi.width in
   let (left, bottom, right, top) = roi.bounds in
+  let resampling = match data_source with MPC -> "near" | AWS -> "bilinear" in
   if groups = [] then begin
     eprintf "  No S1 data to process\n%!";
     ([||], [||], [||], [||])
@@ -578,7 +581,7 @@ let process_s1_groups ~(roi : roi) ~n_workers groups =
           match get_url tile with
           | None -> None
           | Some url ->
-            let amp = read_cog_band ~resampling:"bilinear" ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
+            let amp = read_cog_band ~resampling ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
                         ~width:w ~height:h url in
             let db = amplitude_to_db amp roi.mask h w in
             let has_any = ref false in
@@ -588,18 +591,40 @@ let process_s1_groups ~(roi : roi) ~n_workers groups =
         ) group.sg_tiles in
         if db_list = [] then None
         else begin
-          (* "last valid pixel" mosaic — matches rasterio.merge "first"
-             when our tile order is reversed vs Frank's *)
-          let out = Array.init h (fun _ -> Array.make w 0) in
-          List.iter (fun db ->
-            for i = 0 to h - 1 do
-              for j = 0 to w - 1 do
-                if db.(i).(j) > 0 then
-                  out.(i).(j) <- db.(i).(j)
+          match data_source with
+          | MPC ->
+            (* Mean mosaic — matches Frank's MPC S1 pipeline *)
+            let sum = Array.init h (fun _ -> Array.make w 0.0) in
+            let cnt = Array.init h (fun _ -> Array.make w 0) in
+            List.iter (fun db ->
+              for i = 0 to h - 1 do
+                for j = 0 to w - 1 do
+                  if db.(i).(j) > 0 then begin
+                    sum.(i).(j) <- sum.(i).(j) +. Float.of_int db.(i).(j);
+                    cnt.(i).(j) <- cnt.(i).(j) + 1
+                  end
+                done
               done
-            done
-          ) db_list;
-          Some out
+            ) db_list;
+            let out = Array.init h (fun i ->
+              Array.init w (fun j ->
+                if cnt.(i).(j) > 0
+                then Float.to_int (sum.(i).(j) /. Float.of_int cnt.(i).(j))
+                else 0)) in
+            Some out
+          | AWS ->
+            (* Last-valid-pixel mosaic — matches rasterio.merge "first"
+               when our tile order is reversed vs Frank's *)
+            let out = Array.init h (fun _ -> Array.make w 0) in
+            List.iter (fun db ->
+              for i = 0 to h - 1 do
+                for j = 0 to w - 1 do
+                  if db.(i).(j) > 0 then
+                    out.(i).(j) <- db.(i).(j)
+                done
+              done
+            ) db_list;
+            Some out
         end
       in
 
@@ -873,7 +898,7 @@ let search_cmr_opera ~(client : Stac_client.t)
 
 (** Read orbit direction from a GDAL dataset's metadata tags. *)
 let read_orbit_direction_from_cog url =
-  match Gdal.Dataset.open_ex (gdal_vsi_path url) with
+  match Gdal.Dataset.open_ex ~thread_safe:true (gdal_vsi_path url) with
   | Error _ ->
     eprintf "  Warning: could not open COG for orbit metadata\n%!";
     "unknown"
@@ -1108,7 +1133,7 @@ let () =
           ~bbox:(xmin, ymin, xmax, ymax) ~datetime:date_range
     in
     Printf.printf "Processing Sentinel-1 (%d groups, workers=%d)...\n%!" (List.length s1_groups) n_workers;
-    let (s1a, s1ad, s1de, s1dd) = process_s1_groups ~roi ~n_workers s1_groups in
+    let (s1a, s1ad, s1de, s1dd) = process_s1_groups ~roi ~n_workers ~data_source s1_groups in
     (if data_source = AWS then
       Gdal.set_config_option "GDAL_HTTP_HEADER_FILE" "");
     s1_asc_data := flatten_4d s1a;
