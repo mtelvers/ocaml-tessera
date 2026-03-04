@@ -335,7 +335,8 @@ type date_info = {
 }
 
 (** Analyze SCL for all items, determine valid dates and tile selections.
-    SCL is at 20m = (h/2) x (w/2). Returns list of date_info for valid dates. *)
+    SCL is at 20m = (h/2) x (w/2). Returns (valid_dates, water_mask).
+    water_mask is a bool array at 10m resolution: true = water (skip). *)
 let analyze_scl ~scl_cache_dir ~roi_h ~roi_w items_arr item_dates =
   let scl_h = roi_h / 2 and scl_w = roi_w / 2 in
   let scl_total = scl_h * scl_w in
@@ -353,6 +354,50 @@ let analyze_scl ~scl_cache_dir ~roi_h ~roi_w items_arr item_dates =
       Array1.fill z 0; z
     end
   ) in
+
+  (* Compute per-pixel water frequency at 20m resolution.
+     SCL class 6 = water. Count how many scenes classify each pixel as water
+     vs how many scenes have valid (non-invalid) data for that pixel. *)
+  let water_count = Array.make scl_total 0 in
+  let valid_scene_count = Array.make scl_total 0 in
+  Array.iter (fun scl ->
+    for px = 0 to scl_total - 1 do
+      let v = Array1.get scl px in
+      if not (is_scl_invalid v) then begin
+        valid_scene_count.(px) <- valid_scene_count.(px) + 1;
+        if v = 6 then
+          water_count.(px) <- water_count.(px) + 1
+      end
+    done
+  ) scl_data;
+
+  (* Water mask at 10m: pixel is water if >80% of valid scenes say water *)
+  let water_mask = Array.make (roi_h * roi_w) false in
+  let water_px_count = ref 0 in
+  for sy = 0 to scl_h - 1 do
+    for sx = 0 to scl_w - 1 do
+      let spx = sy * scl_w + sx in
+      let is_water =
+        valid_scene_count.(spx) > 0 &&
+        Float.of_int water_count.(spx) /. Float.of_int valid_scene_count.(spx) > 0.8
+      in
+      if is_water then begin
+        (* Expand 20m pixel to 2x2 block at 10m *)
+        let y0 = sy * 2 and x0 = sx * 2 in
+        for dy = 0 to 1 do
+          for dx = 0 to 1 do
+            let y = y0 + dy and x = x0 + dx in
+            if y < roi_h && x < roi_w then begin
+              water_mask.(y * roi_w + x) <- true;
+              incr water_px_count
+            end
+          done
+        done
+      end
+    done
+  done;
+  let water_pct = 100.0 *. Float.of_int !water_px_count /. Float.of_int (roi_h * roi_w) in
+  Printf.printf "  Water mask: %d pixels (%.1f%%) classified as water\n%!" !water_px_count water_pct;
 
   let valid_dates = ref [] in
   List.iter (fun date_str ->
@@ -386,7 +431,7 @@ let analyze_scl ~scl_cache_dir ~roi_h ~roi_w items_arr item_dates =
                        di_tile_sel = tile_sel; di_item_indices = indices } :: !valid_dates
     end
   ) dates;
-  List.rev !valid_dates
+  (List.rev !valid_dates, water_mask)
 
 (* ======================== Block-based S2 reading ======================== *)
 
@@ -785,6 +830,7 @@ let quantize_symmetric x_f32 =
     The heavy I/O work is done here; sampling happens during inference. *)
 let load_block ~band_cache_dir ~valid_dates ~items_arr ~data_source
     ~s1_groups ~s1_cache_dir ~roi_w
+    ~water_mask
     ~x_off ~y_off ~bw ~bh =
   (* Read S2 block *)
   let (s2_bands_blk, s2_masks_blk, s2_doys_blk) =
@@ -861,17 +907,18 @@ let load_block ~band_cache_dir ~valid_dates ~items_arr ~data_source
   (* Build valid pixel list *)
   let valid_pixels_list = ref [] in
   for px = 0 to total_px - 1 do
+    let i = px / bw and j = px mod bw in
+    let global_idx = (y_off + i) * roi_w + (x_off + j) in
+    let is_water = water_mask.(global_idx) in
     let s1_total = s1_asc_count.(px) + s1_desc_count.(px) in
-    let valid =
+    let valid = not is_water &&
       if s1_asc_empty && s1_desc_empty then
         s2_has_nonzero.(px) && s2_valid_count.(px) >= min_valid_timesteps
       else
         s2_has_nonzero.(px) && s2_valid_count.(px) >= min_valid_timesteps && s1_total >= min_valid_timesteps
     in
-    if valid then begin
-      let i = px / bw and j = px mod bw in
+    if valid then
       valid_pixels_list := (i, j) :: !valid_pixels_list
-    end
   done;
   let valid_pixels = Array.of_list (List.rev !valid_pixels_list) in
 
@@ -955,19 +1002,12 @@ let run_block_inference session ~valid_pixels
   ignore (Sys.opaque_identity s2_input);
   ignore (Sys.opaque_identity s1_input);
 
-  (* Average and quantize, return block-local results *)
+  (* Average, then quantize or keep as float depending on mode *)
   let r_f = Float.of_int repeat_times in
-  let block_emb = Array.init n_valid (fun px ->
-    let avg = Array.init latent_dim (fun k -> sum_z.(px).(k) /. r_f) in
-    let (q, _s) = quantize_symmetric avg in
-    q
+  let avgs = Array.init n_valid (fun px ->
+    Array.init latent_dim (fun k -> sum_z.(px).(k) /. r_f)
   ) in
-  let block_scales = Array.init n_valid (fun px ->
-    let avg = Array.init latent_dim (fun k -> sum_z.(px).(k) /. r_f) in
-    let (_q, s) = quantize_symmetric avg in
-    s
-  ) in
-  (block_emb, block_scales)
+  (avgs, sum_z)
 
 
 (* ======================== OPERA RTC-S1 (AWS) ======================== *)
@@ -1143,10 +1183,19 @@ let prepare_s1_opera ~(client : Stac_client.t) ~bbox ~datetime =
 
 (** Create an empty GeoTIFF with georeferencing. Closes immediately so the
     file exists on disk; subsequent writes reopen in Update mode. *)
-let create_geotiff ~path ~(roi : roi) ~h ~w ~bands dtype =
+type output_format = GeoTIFF | Zarr
+type quant_mode = Int8Scale | Float16 | Float32
+
+let create_output ~fmt ~path ~(roi : roi) ~h ~w ~bands dtype =
   let (origin_x, pixel_w, origin_y, pixel_h) = roi.geotransform in
-  let drv = Gdal.Driver.by_name "GTiff" |> Result.get_ok in
-  let opts = ["COMPRESS=DEFLATE"; "TILED=YES"; "BLOCKXSIZE=256"; "BLOCKYSIZE=256"; "BIGTIFF=YES"] in
+  let (drv_name, opts) = match fmt with
+    | GeoTIFF -> ("GTiff", ["COMPRESS=DEFLATE"; "TILED=YES"; "BLOCKXSIZE=256";
+                             "BLOCKYSIZE=256"; "BIGTIFF=YES"])
+    | Zarr ->
+      let bs = if bands = 1 then "BLOCKSIZE=256,256" else "BLOCKSIZE=1,256,256" in
+      ("Zarr", ["FORMAT=ZARR_V3"; "COMPRESS=BLOSC"; "BLOSC_CNAME=zstd"; bs])
+  in
+  let drv = Gdal.Driver.by_name drv_name |> Result.get_ok in
   let ds = Gdal.Driver.create drv ~filename:path ~width:w ~height:h
              ~bands ~options:opts dtype |> Result.get_ok in
   let gt : Gdal.geo_transform = {
@@ -1157,8 +1206,8 @@ let create_geotiff ~path ~(roi : roi) ~h ~w ~bands dtype =
   ignore (Gdal.Dataset.set_projection ds roi.crs_wkt);
   Gdal.Dataset.close ds
 
-(** Write one block of embeddings: open in Update mode, write, close. *)
-let write_embeddings_block ~path ~x_off ~y_off ~bw ~bh
+(** Write one block of int8 embeddings: open in Update mode, write, close. *)
+let write_embeddings_block_int8 ~path ~x_off ~y_off ~bw ~bh
     (block_emb : int array array) (valid_pixels : (int * int) array) =
   let ds = Gdal.Dataset.open_ ~access:Update path |> Result.get_ok in
   for b = 0 to latent_dim - 1 do
@@ -1169,6 +1218,23 @@ let write_embeddings_block ~path ~x_off ~y_off ~bw ~bh
       Array2.set ba i j (block_emb.(px).(b) land 0xFF)
     ) valid_pixels;
     ignore (Gdal.RasterBand.write_region Gdal.BA_byte band
+              ~x_off ~y_off ~x_size:bw ~y_size:bh ba)
+  done;
+  Gdal.Dataset.close ds
+
+(** Write one block of float16 embeddings: write float32 bigarrays,
+    GDAL converts to float16 on disk. *)
+let write_embeddings_block_f16 ~path ~x_off ~y_off ~bw ~bh
+    (block_emb : float array array) (valid_pixels : (int * int) array) =
+  let ds = Gdal.Dataset.open_ ~access:Update path |> Result.get_ok in
+  for b = 0 to latent_dim - 1 do
+    let band = Gdal.Dataset.get_band ds (b + 1) |> Result.get_ok in
+    let ba = Array2.create float32 c_layout bh bw in
+    Array2.fill ba 0.0;
+    Array.iteri (fun px (i, j) ->
+      Array2.set ba i j block_emb.(px).(b)
+    ) valid_pixels;
+    ignore (Gdal.RasterBand.write_region Gdal.BA_float32 band
               ~x_off ~y_off ~x_size:bw ~y_size:bh ba)
   done;
   Gdal.Dataset.close ds
@@ -1250,6 +1316,8 @@ let () =
   let download_workers = ref 8 in
   let load_workers = ref 3 in
   let block_size = ref 1024 in
+  let output_format_str = ref "geotiff" in
+  let quantize_str = ref "int8" in
 
   let speclist = [
     ("--mgrs", Arg.String (fun id -> mgrs_tiles := id :: !mgrs_tiles), "MGRS tile ID (repeatable)");
@@ -1267,6 +1335,8 @@ let () =
     ("--download_workers", Arg.Set_int download_workers, "Parallel GDAL download workers (default: 8)");
     ("--load_workers", Arg.Set_int load_workers, "Block prefetch workers for inference (default: 3)");
     ("--block_size", Arg.Set_int block_size, "Spatial block size for inference (default: 1024)");
+    ("--format", Arg.Set_string output_format_str, "Output format: geotiff or zarr (default: geotiff)");
+    ("--quantize", Arg.Set_string quantize_str, "Quantization: int8 or float16 (default: int8)");
   ] in
   Arg.parse speclist (fun _ -> ()) "Tessera MGRS tile pipeline";
 
@@ -1274,6 +1344,17 @@ let () =
     | "mpc" -> MPC
     | "aws" -> AWS
     | s -> failwith (Printf.sprintf "Unknown data source: %s (expected mpc or aws)" s)
+  in
+  let out_fmt = match String.lowercase_ascii !output_format_str with
+    | "geotiff" | "tif" -> GeoTIFF
+    | "zarr" -> Zarr
+    | s -> failwith (Printf.sprintf "Unknown format: %s (expected geotiff or zarr)" s)
+  in
+  let quant = match String.lowercase_ascii !quantize_str with
+    | "int8" -> Int8Scale
+    | "float16" | "f16" -> Float16
+    | "float32" | "f32" -> Float32
+    | s -> failwith (Printf.sprintf "Unknown quantize mode: %s (expected int8, float16 or float32)" s)
   in
 
   let mgrs_tiles = List.rev !mgrs_tiles in
@@ -1315,8 +1396,9 @@ let () =
 
     (* Skip if output exists *)
     mkdir_p !output_dir;
-    let emb_tif_path = Filename.concat !output_dir (tile_id ^ ".tif") in
-    let scale_tif_path = Filename.concat !output_dir (tile_id ^ "_scales.tif") in
+    let ext = match out_fmt with GeoTIFF -> ".tif" | Zarr -> ".zarr" in
+    let emb_tif_path = Filename.concat !output_dir (tile_id ^ ext) in
+    let scale_tif_path = Filename.concat !output_dir (tile_id ^ "_scales" ^ ext) in
     begin
 
     (* ---- Step 1: Derive ROI from MGRS tile ---- *)
@@ -1381,7 +1463,7 @@ let () =
 
     (* ---- Step 3: Analyze SCL and filter dates ---- *)
     Printf.printf "\nStep 3: Analyze SCL\n%!";
-    let valid_dates = analyze_scl ~scl_cache_dir:scl_cache
+    let (valid_dates, water_mask) = analyze_scl ~scl_cache_dir:scl_cache
       ~roi_h:h ~roi_w:w items_arr item_dates in
     Printf.printf "  %d valid dates pass cloud filter\n%!" (List.length valid_dates);
 
@@ -1490,11 +1572,12 @@ let () =
     Printf.printf "\n%s\nStep 6: Block-based inference (block_size=%d, workers=%d)\n%s\n%!"
       (String.make 60 '-') blk !load_workers (String.make 60 '-');
 
-    (* Create output GeoTIFFs if they don't exist *)
+    (* Create output files if they don't exist *)
+    let emb_dtype = match quant with Int8Scale -> Gdal.Byte | Float16 -> Gdal.Float16 | Float32 -> Gdal.Float32 in
     if not (Sys.file_exists emb_tif_path) then
-      create_geotiff ~path:emb_tif_path ~roi ~h ~w ~bands:latent_dim Byte;
-    if not (Sys.file_exists scale_tif_path) then
-      create_geotiff ~path:scale_tif_path ~roi ~h ~w ~bands:1 Float32;
+      create_output ~fmt:out_fmt ~path:emb_tif_path ~roi ~h ~w ~bands:latent_dim emb_dtype;
+    if quant = Int8Scale && not (Sys.file_exists scale_tif_path) then
+      create_output ~fmt:out_fmt ~path:scale_tif_path ~roi ~h ~w ~bands:1 Gdal.Float32;
     let tif_mu = Mutex.create () in
 
     let n_rows = (h + blk - 1) / blk in
@@ -1535,9 +1618,16 @@ let () =
         if idx < n_blocks then begin
           let (block_num, y_off, x_off, bh, bw) = blocks.(idx) in
 
-          (* Resume: skip blocks that already have data in both TIFs *)
-          if block_is_complete ~emb_path:emb_tif_path ~scale_path:scale_tif_path
-               ~x_off ~y_off ~bw ~bh then begin
+          (* Resume: skip blocks that already have data *)
+          let is_cached = match quant with
+            | Int8Scale ->
+              block_is_complete ~emb_path:emb_tif_path ~scale_path:scale_tif_path
+                ~x_off ~y_off ~bw ~bh
+            | Float16 | Float32 ->
+              block_is_complete ~emb_path:emb_tif_path ~scale_path:emb_tif_path
+                ~x_off ~y_off ~bw ~bh
+          in
+          if is_cached then begin
             Printf.printf "  Block %d/%d (%d,%d) — cached\n%!" block_num total_blocks y_off x_off;
             Atomic.set inference_started true;
             loop ()
@@ -1551,7 +1641,7 @@ let () =
                s1_asc, s1_asc_doy, s1_desc, s1_desc_doy) =
             load_block ~band_cache_dir:band_cache ~valid_dates
               ~items_arr ~data_source ~s1_groups ~s1_cache_dir:s1_cache
-              ~roi_w:w ~x_off ~y_off ~bw ~bh in
+              ~roi_w:w ~water_mask ~x_off ~y_off ~bw ~bh in
 
           let n_valid = Array.length valid_pixels in
           let t_loaded = Unix.gettimeofday () in
@@ -1562,7 +1652,7 @@ let () =
             Mutex.lock gpu_mu;
             Atomic.set inference_started true;
             let t_infer_start = Unix.gettimeofday () in
-            let (block_emb, block_scales) =
+            let (avgs, _sum_z) =
               run_block_inference session ~valid_pixels
                 ~s2_bands ~s2_masks ~s2_doys
                 ~s1_asc ~s1_asc_doy ~s1_desc ~s1_desc_doy
@@ -1570,12 +1660,21 @@ let () =
             let t_infer_end = Unix.gettimeofday () in
             Mutex.unlock gpu_mu;
 
-            (* Write block to GeoTIFF (open, write, close each time) *)
+            (* Write block output (open, write, close each time) *)
             Mutex.lock tif_mu;
-            write_embeddings_block ~path:emb_tif_path ~x_off ~y_off ~bw ~bh
-              block_emb valid_pixels;
-            write_scales_block ~path:scale_tif_path ~x_off ~y_off ~bw ~bh
-              block_scales valid_pixels;
+            (match quant with
+             | Int8Scale ->
+               let block_emb = Array.map (fun avg ->
+                 let (q, _s) = quantize_symmetric avg in q) avgs in
+               let block_scales = Array.map (fun avg ->
+                 let (_q, s) = quantize_symmetric avg in s) avgs in
+               write_embeddings_block_int8 ~path:emb_tif_path ~x_off ~y_off ~bw ~bh
+                 block_emb valid_pixels;
+               write_scales_block ~path:scale_tif_path ~x_off ~y_off ~bw ~bh
+                 block_scales valid_pixels
+             | Float16 | Float32 ->
+               write_embeddings_block_f16 ~path:emb_tif_path ~x_off ~y_off ~bw ~bh
+                 avgs valid_pixels);
             Mutex.unlock tif_mu;
 
             Printf.printf "    Block %d: inference %.1fs (total %.1fs)\n%!"
@@ -1599,8 +1698,14 @@ let () =
 
     let t_inference = Unix.gettimeofday () in
     Printf.printf "\nInference complete: %.1fs\n%!" (t_inference -. t_download);
-    Printf.printf "  TIF: %s  (%d bands, int8)\n%!" emb_tif_path latent_dim;
-    Printf.printf "  TIF: %s  (1 band, float32)\n%!" scale_tif_path;
+    (match quant with
+     | Int8Scale ->
+       Printf.printf "  Output: %s  (%d bands, int8)\n%!" emb_tif_path latent_dim;
+       Printf.printf "  Output: %s  (1 band, float32)\n%!" scale_tif_path
+     | Float16 ->
+       Printf.printf "  Output: %s  (%d bands, float16)\n%!" emb_tif_path latent_dim
+     | Float32 ->
+       Printf.printf "  Output: %s  (%d bands, float32)\n%!" emb_tif_path latent_dim);
 
     let t_done = Unix.gettimeofday () in
     Printf.printf "\nTile %s done (total %.1fs)\n%!" tile_id (t_done -. t_tile_start);
