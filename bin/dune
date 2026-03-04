@@ -1,3 +1,7 @@
 (executables
  (names pipeline bench_gdal)
  (libraries stac_client gdal onnxruntime yojson unix bigarray))
+
+(executable
+ (name dpixel)
+ (libraries stac_client gdal npy yojson unix bigarray))
