@@ -198,6 +198,7 @@ let warp_to_mem ?(resampling="near") ~dst_crs_wkt ~bounds:(left, bottom, right, 
       "-ts"; string_of_int width; string_of_int height;
       "-r"; resampling;
       "-of"; "MEM";
+      "-srcnodata"; "none";
     ] in
     let result = Gdal.Dataset.warp src ~dst_filename:dst opts in
     Gdal.Dataset.close src;
@@ -397,7 +398,7 @@ let process_s2 ~(roi : roi) ~(client : Stac_client.t) ~data_source ~n_workers it
             match get_asset_href access_item band_name with
             | None -> Array.make (h * w) 0.0
             | Some href ->
-              read_cog_band ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
+              read_cog_band ~resampling:"cubic" ~dst_crs_wkt:roi.crs_wkt ~bounds:(left, bottom, right, top)
                 ~width:w ~height:h href
           ) (s2_band_names data_source)
         ) indices in
@@ -726,18 +727,309 @@ let prepare_s1_opera ~(client : Stac_client.t) ~bbox ~datetime =
 
 (* ======================== NPY save helpers ======================== *)
 
-let save_flat_4d path (f : flat_4d) =
+(* Save bands.npy as uint16 (S2 sensor values fit in 0-65535) *)
+let save_bands path (f : flat_4d) =
   let total = f.n * f.h * f.w * f.c in
-  let arr = Array.init total (fun i -> Array1.get f.data i) in
-  Npy.save path (Npy.of_float_array Npy.Float64 [| f.n; f.h; f.w; f.c |] arr)
+  let arr = Array.init total (fun i ->
+    let v = Array1.get f.data i in
+    Float.to_int (Float.max 0.0 (Float.min 65535.0 v))) in
+  Npy.save path (Npy.of_int_array Npy.Uint16 [| f.n; f.h; f.w; f.c |] arr)
 
-let save_flat_3d_int path (f : flat_3d_int) =
+(* Save masks.npy as uint8 (0 or 1) *)
+let save_masks path (f : flat_3d_int) =
   let total = f.n3 * f.h3 * f.w3 in
   let arr = Array.init total (fun i -> Array1.get f.idata i) in
-  Npy.save path (Npy.of_int_array Npy.Int32 [| f.n3; f.h3; f.w3 |] arr)
+  Npy.save path (Npy.of_int_array Npy.Uint8 [| f.n3; f.h3; f.w3 |] arr)
 
-let save_1d_int path arr =
-  Npy.save path (Npy.of_int_array Npy.Int32 [| Array.length arr |] arr)
+(* Save S2 doys as uint16 (day-of-year 1-366) *)
+let save_doys_uint16 path arr =
+  Npy.save path (Npy.of_int_array Npy.Uint16 [| Array.length arr |] arr)
+
+(* Save SAR data as int16 (dB-scaled values fit in 0-32767) *)
+let save_sar path (f : flat_4d) =
+  let total = f.n * f.h * f.w * f.c in
+  let arr = Array.init total (fun i ->
+    Float.to_int (Array1.get f.data i)) in
+  Npy.save path (Npy.of_int_array Npy.Int16 [| f.n; f.h; f.w; f.c |] arr)
+
+(* Save SAR doys as int16 *)
+let save_doys_int16 path arr =
+  Npy.save path (Npy.of_int_array Npy.Int16 [| Array.length arr |] arr)
+
+(* ======================== OmniCloudMask ======================== *)
+
+(** Per-channel normalize a (3, H, W) float32 bigarray in-place style.
+    For each channel: compute mean/std of non-zero pixels, normalize non-zero,
+    leave zeros as 0.0. Returns a new bigarray. *)
+let channel_norm_3chw ~h ~w
+    (src : (float, float32_elt, c_layout) Array1.t) =
+  let out = Array1.create float32 c_layout (3 * h * w) in
+  Array1.fill out 0.0;
+  for c = 0 to 2 do
+    let base = c * h * w in
+    (* First pass: mean of non-zero *)
+    let sum = ref 0.0 in
+    let cnt = ref 0 in
+    for k = 0 to h * w - 1 do
+      let v = Array1.get src (base + k) in
+      if v <> 0.0 then begin
+        sum := !sum +. v;
+        incr cnt
+      end
+    done;
+    if !cnt > 0 then begin
+      let mean = !sum /. Float.of_int !cnt in
+      (* Second pass: std *)
+      let sq_sum = ref 0.0 in
+      for k = 0 to h * w - 1 do
+        let v = Array1.get src (base + k) in
+        if v <> 0.0 then begin
+          let d = v -. mean in
+          sq_sum := !sq_sum +. d *. d
+        end
+      done;
+      let std = Float.sqrt (!sq_sum /. Float.of_int !cnt) in
+      let std = if std = 0.0 then 1.0 else std in
+      (* Third pass: normalize *)
+      for k = 0 to h * w - 1 do
+        let v = Array1.get src (base + k) in
+        if v <> 0.0 then
+          Array1.set out (base + k) ((v -. mean) /. std)
+      done
+    end
+  done;
+  out
+
+(** Generate overlapping patch coordinates.
+    Returns list of (top, bottom, left, right). *)
+let make_patch_indexes ~array_height ~array_width ~patch_size ~patch_overlap =
+  let stride = patch_size - patch_overlap in
+  let max_bottom = array_height - patch_size in
+  let max_right = array_width - patch_size in
+  let patches = ref [] in
+  let top = ref 0 in
+  while !top < array_height do
+    let t = if !top > max_bottom then max_bottom else !top in
+    let bottom = t + patch_size in
+    let left = ref 0 in
+    while !left < array_width do
+      let l = if !left > max_right then max_right else !left in
+      let right = l + patch_size in
+      patches := (t, bottom, l, right) :: !patches;
+      left := !left + stride
+    done;
+    top := !top + stride
+  done;
+  List.rev !patches
+
+(** Create gradient blending mask (patch_size x patch_size) as flat float32 bigarray.
+    Matches Python create_gradient_mask exactly. *)
+let create_gradient_mask ~patch_size ~patch_overlap =
+  let ps = patch_size in
+  let po = if patch_overlap * 2 > ps then ps / 2 else patch_overlap in
+  let grad = Array1.create float32 c_layout (ps * ps) in
+  if po > 0 then begin
+    (* horizontal gradient: columns *)
+    let fpo = Float.of_int po in
+    for i = 0 to ps - 1 do
+      for j = 0 to ps - 1 do
+        let h_val =
+          if j < po then Float.of_int (j + 1) /. fpo
+          else if j >= ps - po then Float.of_int (ps - j) /. fpo
+          else 1.0
+        in
+        (* vertical gradient: rows (= rotated horizontal) *)
+        let v_val =
+          if i < po then Float.of_int (i + 1) /. fpo
+          else if i >= ps - po then Float.of_int (ps - i) /. fpo
+          else 1.0
+        in
+        Array1.set grad (i * ps + j) (h_val *. v_val)
+      done
+    done
+  end else
+    Array1.fill grad 1.0;
+  grad
+
+(** Run both OCM sessions on one (3, H, W) normalized image.
+    Returns flat (H, W) int array of class predictions (0=clear, 1/2/3=cloud). *)
+let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
+    (norm_img : (float, float32_elt, c_layout) Array1.t) =
+  let ps = patch_size in
+  let patches = make_patch_indexes ~array_height:h ~array_width:w
+      ~patch_size:ps ~patch_overlap in
+  let gradient = create_gradient_mask ~patch_size:ps ~patch_overlap in
+
+  (* Accumulators: (4, H, W) predictions and (H, W) weight sums *)
+  let pred = Array1.create float32 c_layout (4 * h * w) in
+  Array1.fill pred 0.0;
+  let wsum = Array1.create float32 c_layout (h * w) in
+  Array1.fill wsum 0.0;
+
+  (* Deduplicate patches *)
+  let seen = Hashtbl.create 256 in
+  let unique_patches = List.filter (fun idx ->
+    if Hashtbl.mem seen idx then false
+    else begin Hashtbl.replace seen idx (); true end
+  ) patches in
+
+  (* Process in batches *)
+  let patch_arr = Array.of_list unique_patches in
+  let n_patches = Array.length patch_arr in
+  let batch_idx = ref 0 in
+  while !batch_idx < n_patches do
+    let actual_b = min batch_size (n_patches - !batch_idx) in
+
+    (* Extract patches into (B, 3, ps, ps) flat bigarray *)
+    let patch_ba = Array1.create float32 c_layout (actual_b * 3 * ps * ps) in
+    Array1.fill patch_ba 0.0;
+    for b = 0 to actual_b - 1 do
+      let (top, _bottom, left, _right) = patch_arr.(!batch_idx + b) in
+      for c = 0 to 2 do
+        for pi = 0 to ps - 1 do
+          for pj = 0 to ps - 1 do
+            let si = top + pi and sj = left + pj in
+            let src_idx = c * h * w + si * w + sj in
+            let dst_idx = ((b * 3 + c) * ps + pi) * ps + pj in
+            Array1.set patch_ba dst_idx (Array1.get norm_img src_idx)
+          done
+        done
+      done
+    done;
+
+    (* Check if entire batch is zeros — skip if so *)
+    let all_zero = ref true in
+    for k = 0 to Array1.dim patch_ba - 1 do
+      if Array1.get patch_ba k <> 0.0 then all_zero := false
+    done;
+
+    if not !all_zero then begin
+      (* Run both models *)
+      let shape = [| Int64.of_int actual_b; 3L;
+                     Int64.of_int ps; Int64.of_int ps |] in
+      let out_size = actual_b * 4 * ps * ps in
+      let out1 = Onnxruntime.Session.run_ba sess1
+        [| ("input", patch_ba, shape) |]
+        [| "output" |]
+        ~output_sizes:[| out_size |] in
+      let out2 = Onnxruntime.Session.run_ba sess2
+        [| ("input", patch_ba, shape) |]
+        [| "output" |]
+        ~output_sizes:[| out_size |] in
+      let o1 = out1.(0) and o2 = out2.(0) in
+
+      (* Average and accumulate with gradient blending *)
+      for b = 0 to actual_b - 1 do
+        let (top, _bottom, left, _right) = patch_arr.(!batch_idx + b) in
+        for cls = 0 to 3 do
+          for pi = 0 to ps - 1 do
+            for pj = 0 to ps - 1 do
+              let oidx = ((b * 4 + cls) * ps + pi) * ps + pj in
+              let avg = (Array1.get o1 oidx +. Array1.get o2 oidx) *. 0.5 in
+              let gw = Array1.get gradient (pi * ps + pj) in
+              let si = top + pi and sj = left + pj in
+              let pidx = cls * h * w + si * w + sj in
+              Array1.set pred pidx (Array1.get pred pidx +. avg *. gw)
+            done
+          done
+        done;
+        (* Accumulate gradient weights *)
+        for pi = 0 to ps - 1 do
+          for pj = 0 to ps - 1 do
+            let gw = Array1.get gradient (pi * ps + pj) in
+            let si = top + pi and sj = left + pj in
+            let widx = si * w + sj in
+            Array1.set wsum widx (Array1.get wsum widx +. gw)
+          done
+        done
+      done
+    end;
+
+    batch_idx := !batch_idx + actual_b
+  done;
+
+  (* Argmax over 4 classes → (H, W) int array *)
+  let result = Array.make (h * w) 0 in
+  for i = 0 to h - 1 do
+    for j = 0 to w - 1 do
+      let idx = i * w + j in
+      let ws = Array1.get wsum idx in
+      if ws > 0.0 then begin
+        let best_cls = ref 0 in
+        let best_val = ref neg_infinity in
+        for cls = 0 to 3 do
+          let v = Array1.get pred (cls * h * w + idx) /. ws in
+          if v > !best_val then begin best_val := v; best_cls := cls end
+        done;
+        result.(idx) <- !best_cls
+      end
+    done
+  done;
+  result
+
+(** Run OmniCloudMask on all timesteps. Returns flat (T*H*W) int array for mask_optimized. *)
+let run_ocm ~model1_path ~model2_path ~n_threads
+    ~patch_size ~patch_overlap ~batch_size
+    ~(s2_bands_data : flat_4d) ~(s2_masks_data : flat_3d_int) =
+  let n_t = s2_bands_data.n in
+  let h = s2_bands_data.h and w = s2_bands_data.w in
+  Printf.printf "  OCM: %d timesteps, %dx%d\n%!" n_t h w;
+
+  let env = Onnxruntime.Env.create ~log_level:3 "ocm" in
+  let sess1 = Onnxruntime.Session.create env ~threads:n_threads model1_path in
+  let sess2 = Onnxruntime.Session.create env ~threads:n_threads model2_path in
+
+  (* Auto patch size *)
+  let ps = if patch_size <= 0 then min 1000 (min h w) else patch_size in
+  let ps = max ps 32 in
+  let po = min patch_overlap (ps / 2) in
+  Printf.printf "  OCM patch_size=%d, overlap=%d, batch_size=%d\n%!" ps po batch_size;
+
+  let mask_opt = Array.make (n_t * h * w) 0 in
+
+  for t = 0 to n_t - 1 do
+    (* Extract R(B04=idx0), G(B03=idx2), NIR(B8A=idx4) into (3, H, W) float32 *)
+    let rgn = Array1.create float32 c_layout (3 * h * w) in
+    let band_indices = [| 0; 2; 4 |] in
+    for c = 0 to 2 do
+      let bi = band_indices.(c) in
+      for i = 0 to h - 1 do
+        for j = 0 to w - 1 do
+          let src_idx = ((t * h + i) * w + j) * 10 + bi in
+          let v = Array1.get s2_bands_data.data src_idx in
+          Array1.set rgn (c * h * w + i * w + j) v
+        done
+      done
+    done;
+
+    (* Channel normalize *)
+    let norm = channel_norm_3chw ~h ~w rgn in
+
+    (* Run OCM *)
+    let ocm_class = run_ocm_on_image ~sess1 ~sess2 ~h ~w
+        ~patch_size:ps ~patch_overlap:po ~batch_size norm in
+
+    (* Merge: mask_optimized[t] = (scl_mask==1) AND (ocm_class==0) AND (not all-zero) *)
+    for i = 0 to h - 1 do
+      for j = 0 to w - 1 do
+        let px = i * w + j in
+        let scl_valid = Array1.get s2_masks_data.idata (t * h * w + px) = 1 in
+        let ocm_clear = ocm_class.(px) = 0 in
+        (* Check if all 3 channels are zero (nodata) *)
+        let all_zero =
+          Array1.get rgn (0 * h * w + px) = 0.0 &&
+          Array1.get rgn (1 * h * w + px) = 0.0 &&
+          Array1.get rgn (2 * h * w + px) = 0.0 in
+        if scl_valid && ocm_clear && not all_zero then
+          mask_opt.(t * h * w + px) <- 1
+      done
+    done;
+
+    if (t + 1) mod 10 = 0 || t = n_t - 1 then
+      Printf.printf "  [%d/%d] timesteps processed\n%!" (t + 1) n_t
+  done;
+  { idata = Array1.of_array int c_layout mask_opt;
+    n3 = n_t; h3 = h; w3 = w }
 
 (* ======================== Main ======================== *)
 
@@ -748,7 +1040,14 @@ let () =
   let end_date = ref "2024-12-31" in
   let max_cloud = ref 100.0 in
   let data_source_str = ref "mpc" in
-  let download_workers = ref 8 in
+  let download_workers = ref 32 in
+  let ocm_model_1 = ref "ocm_regnety_004.onnx" in
+  let ocm_model_2 = ref "ocm_edgenext_small.onnx" in
+  let ocm_patch_size = ref 0 in
+  let ocm_batch_size = ref 16 in
+  let ocm_patch_overlap = ref 300 in
+  let ocm_threads = ref 4 in
+  let flat_output = ref false in
 
   let speclist = [
     ("--input_tiff", Arg.Set_string input_tiff, "Path to grid GeoTIFF");
@@ -757,7 +1056,14 @@ let () =
     ("--end", Arg.Set_string end_date, "End date (YYYY-MM-DD)");
     ("--max_cloud", Arg.Set_float max_cloud, "Max cloud cover %");
     ("--data_source", Arg.Set_string data_source_str, "Data source: mpc or aws (default: mpc)");
-    ("--download_workers", Arg.Set_int download_workers, "Parallel GDAL download workers (default: 8)");
+    ("--download_workers", Arg.Set_int download_workers, "Parallel GDAL download workers (default: 32)");
+    ("--ocm_model_1", Arg.Set_string ocm_model_1, "Path to first OCM ONNX model");
+    ("--ocm_model_2", Arg.Set_string ocm_model_2, "Path to second OCM ONNX model");
+    ("--ocm_patch_size", Arg.Set_int ocm_patch_size, "OCM patch size, 0=auto (default: 0)");
+    ("--ocm_batch_size", Arg.Set_int ocm_batch_size, "OCM patches per batch (default: 16)");
+    ("--ocm_patch_overlap", Arg.Set_int ocm_patch_overlap, "OCM overlap pixels (default: 300)");
+    ("--ocm_threads", Arg.Set_int ocm_threads, "OCM ONNX Runtime threads (default: 4)");
+    ("--flat_output", Arg.Set flat_output, "Write .npy files directly to --output (no subdirectory)");
   ] in
   Arg.parse speclist (fun _ -> ()) "Tessera dpixel download tool";
 
@@ -772,7 +1078,8 @@ let () =
 
   let grid_id = Filename.remove_extension (Filename.basename !input_tiff) in
   let date_range = !start_date ^ "/" ^ !end_date in
-  let out_dir = Filename.concat !output_dir grid_id in
+  let out_dir = if !flat_output then !output_dir
+                else Filename.concat !output_dir grid_id in
 
   (* Skip if already complete *)
   if Sys.file_exists (Filename.concat out_dir "bands.npy") then begin
@@ -789,11 +1096,15 @@ let () =
   Printf.printf "  Tile: %dx%d, resolution=%.6f\n%!" roi.height roi.width roi.resolution;
   let (xmin, ymin, xmax, ymax) = roi.bbox in
 
-  if data_source = AWS then begin
-    Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" "EMPTY_DIR";
-    Gdal.set_config_option "GDAL_HTTP_MULTIRANGE" "YES";
-    Gdal.set_config_option "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES" "YES";
-  end;
+  (* GDAL HTTP tuning for remote COG access *)
+  Gdal.set_config_option "GDAL_DISABLE_READDIR_ON_OPEN" "EMPTY_DIR";
+  Gdal.set_config_option "GDAL_HTTP_MULTIRANGE" "YES";
+  Gdal.set_config_option "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES" "YES";
+  Gdal.set_config_option "GDAL_HTTP_MULTIPLEX" "YES";
+  Gdal.set_config_option "GDAL_HTTP_VERSION" "2";
+  Gdal.set_config_option "CPL_VSIL_CURL_CACHE_SIZE" "134217728";
+  Gdal.set_config_option "GDAL_HTTP_MAX_RETRY" "3";
+  Gdal.set_config_option "GDAL_HTTP_RETRY_DELAY" "1";
 
   (* Sentinel-2 *)
   let s2_base_url = match data_source with
@@ -857,14 +1168,36 @@ let () =
   (* Save dpixel .npy files *)
   mkdir_p out_dir;
   Printf.printf "\nSaving dpixel data to %s\n%!" out_dir;
-  save_flat_4d (Filename.concat out_dir "bands.npy") s2_bands_data;
-  save_flat_3d_int (Filename.concat out_dir "masks.npy") s2_masks_data;
-  save_1d_int (Filename.concat out_dir "doys.npy") s2_doys_data;
-  save_flat_4d (Filename.concat out_dir "sar_ascending.npy") s1_asc_data;
-  save_1d_int (Filename.concat out_dir "sar_ascending_doy.npy") s1_asc_doy_data;
-  save_flat_4d (Filename.concat out_dir "sar_descending.npy") s1_desc_data;
-  save_1d_int (Filename.concat out_dir "sar_descending_doy.npy") s1_desc_doy_data;
+  save_bands (Filename.concat out_dir "bands.npy") s2_bands_data;
+  save_masks (Filename.concat out_dir "masks.npy") s2_masks_data;
+  save_doys_uint16 (Filename.concat out_dir "doys.npy") s2_doys_data;
+  save_sar (Filename.concat out_dir "sar_ascending.npy") s1_asc_data;
+  save_doys_int16 (Filename.concat out_dir "sar_ascending_doy.npy") s1_asc_doy_data;
+  save_sar (Filename.concat out_dir "sar_descending.npy") s1_desc_data;
+  save_doys_int16 (Filename.concat out_dir "sar_descending_doy.npy") s1_desc_doy_data;
+
+  Printf.printf "  Saved 7 .npy files\n%!";
+
+  (* OmniCloudMask *)
+  if Sys.file_exists !ocm_model_1 && Sys.file_exists !ocm_model_2 then begin
+    if s2_bands_data.n > 0 then begin
+      Printf.printf "\nRunning OmniCloudMask...\n%!";
+      let t_ocm_start = Unix.gettimeofday () in
+      let mask_opt = run_ocm
+        ~model1_path:!ocm_model_1
+        ~model2_path:!ocm_model_2
+        ~n_threads:!ocm_threads
+        ~patch_size:!ocm_patch_size
+        ~patch_overlap:!ocm_patch_overlap
+        ~batch_size:!ocm_batch_size
+        ~s2_bands_data ~s2_masks_data in
+      save_masks (Filename.concat out_dir "mask_optimized.npy") mask_opt;
+      let t_ocm_end = Unix.gettimeofday () in
+      Printf.printf "  Saved mask_optimized.npy (%.1fs)\n%!" (t_ocm_end -. t_ocm_start)
+    end else
+      Printf.printf "\nSkipping OCM: no S2 timesteps\n%!"
+  end else
+    Printf.printf "\nSkipping OCM: model files not found\n%!";
 
   let t_end = Unix.gettimeofday () in
-  Printf.printf "  Saved 7 .npy files\n%!";
   Printf.printf "\nDone: %s (%.1fs)\n%!" grid_id (t_end -. t_start)

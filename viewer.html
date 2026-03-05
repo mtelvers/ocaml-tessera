@@ -1,0 +1,1260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DPixel Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e; color: #e0e0e0; font-family: 'Segoe UI', system-ui, sans-serif;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    user-select: none;
+  }
+
+  /* Top toolbar */
+  #toolbar {
+    display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+    background: #16213e; border-bottom: 1px solid #0f3460; flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  #toolbar .group {
+    display: flex; align-items: center; gap: 4px;
+    padding: 0 8px; border-right: 1px solid #0f3460;
+  }
+  #toolbar .group:last-child { border-right: none; }
+  #toolbar label { font-size: 11px; color: #8899aa; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 4px; }
+  button {
+    background: #0f3460; color: #e0e0e0; border: 1px solid #1a4a7a;
+    padding: 4px 10px; border-radius: 3px; cursor: pointer; font-size: 12px;
+    transition: background 0.15s;
+  }
+  button:hover { background: #1a4a7a; }
+  button.active { background: #e94560; border-color: #e94560; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  /* Main area */
+  #main {
+    display: flex; flex: 1; min-height: 0;
+  }
+
+  /* Canvas area */
+  #canvas-area {
+    flex: 1; position: relative; overflow: hidden; cursor: grab;
+    background: #0a0a1a;
+  }
+  #canvas-area:active { cursor: grabbing; }
+  #canvas-area canvas {
+    position: absolute; top: 0; left: 0;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+
+  /* Info panel */
+  #info-panel {
+    width: 240px; background: #16213e; border-left: 1px solid #0f3460;
+    padding: 12px; overflow-y: auto; flex-shrink: 0; font-size: 12px;
+  }
+  #info-panel h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: #e94560; margin: 12px 0 6px 0; padding-bottom: 4px;
+    border-bottom: 1px solid #0f3460;
+  }
+  #info-panel h3:first-child { margin-top: 0; }
+  #info-panel .row { display: flex; justify-content: space-between; padding: 2px 0; }
+  #info-panel .row .key { color: #8899aa; }
+  #info-panel .row .val { color: #fff; font-family: monospace; }
+
+  /* Timeline */
+  #timeline {
+    height: 80px; background: #16213e; border-top: 1px solid #0f3460;
+    flex-shrink: 0; position: relative; padding: 4px 12px;
+  }
+  #timeline-canvas { width: 100%; height: 100%; display: block; }
+
+  /* Timestep slider */
+  #slider-row {
+    display: flex; align-items: center; gap: 8px; padding: 4px 12px;
+    background: #121e38; border-top: 1px solid #0f3460; flex-shrink: 0;
+  }
+  #slider-row input[type=range] { flex: 1; }
+  #slider-row span { font-size: 12px; font-family: monospace; min-width: 80px; }
+
+  /* Drop zone overlay */
+  #drop-zone {
+    position: fixed; inset: 0; z-index: 1000;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 16px;
+    background: #1a1a2e;
+  }
+  #drop-zone.drag-over { background: #1a2a4e; }
+  #drop-zone .icon { font-size: 64px; color: #0f3460; }
+  #drop-zone h2 { color: #e94560; font-weight: 400; }
+  #drop-zone p { color: #8899aa; font-size: 14px; max-width: 400px; text-align: center; }
+  #drop-zone .browse-btn {
+    background: #e94560; border: none; color: #fff; padding: 8px 24px;
+    border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 8px;
+  }
+  #drop-zone .browse-btn:hover { background: #ff5a78; }
+  #drop-zone.hidden { display: none; }
+
+  /* Pixel info tooltip */
+  #pixel-info {
+    position: absolute; background: rgba(0,0,0,0.85); color: #fff;
+    padding: 4px 8px; border-radius: 3px; font-size: 11px; font-family: monospace;
+    pointer-events: none; z-index: 10; display: none; white-space: pre;
+  }
+
+  /* Stretch controls */
+  #stretch-controls { display: flex; align-items: center; gap: 4px; }
+  #stretch-controls input[type=number] {
+    width: 55px; background: #0a1628; border: 1px solid #1a4a7a;
+    color: #fff; padding: 2px 4px; font-size: 12px; border-radius: 2px;
+    font-family: monospace;
+  }
+</style>
+</head>
+<body>
+
+<!-- Drop zone (shown initially) -->
+<div id="drop-zone">
+  <div class="icon">&#128194;</div>
+  <h2>DPixel Viewer</h2>
+  <p>Drag and drop a dpixel output folder here, or click to browse for .npy files.</p>
+  <button class="browse-btn" id="browse-btn">Browse Files</button>
+  <input type="file" id="file-input" multiple accept=".npy" style="display:none" webkitdirectory>
+  <p style="font-size:11px; color:#555; margin-top:12px;">
+    Expected files: bands.npy, masks.npy, doys.npy, mask_optimized.npy,<br>
+    sar_ascending.npy, sar_ascending_doy.npy, sar_descending.npy, sar_descending_doy.npy
+  </p>
+</div>
+
+<!-- Main UI (hidden until data loaded) -->
+<div id="toolbar" style="display:none">
+  <div class="group">
+    <label>View</label>
+    <button id="btn-true-color" class="active" onclick="setComposite('true')">True Color</button>
+    <button id="btn-fci" onclick="setComposite('fci')">False Color IR</button>
+    <button id="btn-swir" onclick="setComposite('swir')">SWIR</button>
+    <button id="btn-ndvi" onclick="setComposite('ndvi')">NDVI</button>
+    <button id="btn-sar-vv" onclick="setComposite('sar-vv')">SAR VV</button>
+    <button id="btn-sar-vh" onclick="setComposite('sar-vh')">SAR VH</button>
+  </div>
+  <div class="group">
+    <label>Mask</label>
+    <button id="btn-mask-scl" onclick="toggleMask('scl')">SCL</button>
+    <button id="btn-mask-ocm" onclick="toggleMask('ocm')">OCM</button>
+  </div>
+  <div class="group">
+    <label>Stretch</label>
+    <div id="stretch-controls">
+      <input type="number" id="stretch-min" value="0" step="100" title="Min value">
+      <span style="color:#555">-</span>
+      <input type="number" id="stretch-max" value="3000" step="100" title="Max value">
+      <button onclick="applyStretch()" style="font-size:11px; padding:3px 6px;">Apply</button>
+      <button onclick="autoStretch()" style="font-size:11px; padding:3px 6px;">Auto</button>
+    </div>
+  </div>
+  <div class="group">
+    <label>Zoom</label>
+    <button onclick="zoomTo(1)">1:1</button>
+    <button onclick="fitToView()">Fit</button>
+    <span id="zoom-label" style="font-size:12px; font-family:monospace; min-width:40px;">100%</span>
+  </div>
+</div>
+
+<div id="main" style="display:none">
+  <div id="canvas-area">
+    <canvas id="canvas"></canvas>
+    <div id="pixel-info"></div>
+  </div>
+  <div id="info-panel">
+    <h3>Data Info</h3>
+    <div id="info-data"></div>
+    <h3>Current Frame</h3>
+    <div id="info-frame"></div>
+    <h3>Pixel</h3>
+    <div id="info-pixel">
+      <div class="row"><span class="key">Hover over image</span></div>
+    </div>
+    <h3>Files Loaded</h3>
+    <div id="info-files"></div>
+  </div>
+</div>
+
+<div id="slider-row" style="display:none">
+  <span id="slider-label">T: 0/0</span>
+  <input type="range" id="timestep-slider" min="0" max="0" value="0">
+  <span id="doy-label">DOY: --</span>
+  <span id="date-label"></span>
+</div>
+
+<div id="timeline" style="display:none">
+  <canvas id="timeline-canvas"></canvas>
+</div>
+
+<script>
+"use strict";
+
+// ==================== NPY PARSER ====================
+
+function parseNpy(buffer) {
+  const view = new DataView(buffer);
+  // Check magic: \x93NUMPY
+  const magic = new Uint8Array(buffer, 0, 6);
+  if (magic[0] !== 0x93 || magic[1] !== 0x4E || magic[2] !== 0x55 ||
+      magic[3] !== 0x4D || magic[4] !== 0x50 || magic[5] !== 0x59) {
+    throw new Error("Not a valid .npy file");
+  }
+  const majorVersion = view.getUint8(6);
+  const minorVersion = view.getUint8(7);
+
+  let headerLen, headerOffset;
+  if (majorVersion === 1) {
+    headerLen = view.getUint16(8, true);
+    headerOffset = 10;
+  } else if (majorVersion === 2) {
+    headerLen = view.getUint32(8, true);
+    headerOffset = 12;
+  } else {
+    throw new Error("Unsupported npy version: " + majorVersion + "." + minorVersion);
+  }
+
+  const headerBytes = new Uint8Array(buffer, headerOffset, headerLen);
+  const headerStr = new TextDecoder().decode(headerBytes).trim();
+
+  // Parse Python dict: {'descr': '<u2', 'fortran_order': False, 'shape': (10, 64, 64, 10), }
+  const descrMatch = headerStr.match(/'descr'\s*:\s*'([^']+)'/);
+  const fortranMatch = headerStr.match(/'fortran_order'\s*:\s*(True|False)/);
+  const shapeMatch = headerStr.match(/'shape'\s*:\s*\(([^)]*)\)/);
+
+  if (!descrMatch || !shapeMatch) {
+    throw new Error("Failed to parse npy header: " + headerStr);
+  }
+
+  const descr = descrMatch[1];
+  const fortranOrder = fortranMatch ? fortranMatch[1] === 'True' : false;
+  const shapeStr = shapeMatch[1].trim();
+  const shape = shapeStr === '' ? [] : shapeStr.split(',').map(s => s.trim()).filter(s => s !== '').map(Number);
+
+  const dataOffset = headerOffset + headerLen;
+  const dataBuffer = buffer.slice(dataOffset);
+
+  // Determine byte order and dtype
+  const endianChar = descr[0];
+  const typeChar = descr[1];
+  const byteSize = parseInt(descr.slice(2));
+  const littleEndian = endianChar === '<' || endianChar === '|' || endianChar === '=';
+
+  let typedArray;
+  if (typeChar === 'u' && byteSize === 1) {
+    typedArray = new Uint8Array(dataBuffer);
+  } else if (typeChar === 'u' && byteSize === 2) {
+    typedArray = new Uint16Array(dataBuffer);
+    if (!littleEndian) swapEndian16(typedArray);
+  } else if (typeChar === 'u' && byteSize === 4) {
+    typedArray = new Uint32Array(dataBuffer);
+    if (!littleEndian) swapEndian32(typedArray);
+  } else if (typeChar === 'i' && byteSize === 1) {
+    typedArray = new Int8Array(dataBuffer);
+  } else if (typeChar === 'i' && byteSize === 2) {
+    typedArray = new Int16Array(dataBuffer);
+    if (!littleEndian) swapEndian16(typedArray);
+  } else if (typeChar === 'i' && byteSize === 4) {
+    typedArray = new Int32Array(dataBuffer);
+    if (!littleEndian) swapEndian32(typedArray);
+  } else if (typeChar === 'f' && byteSize === 4) {
+    typedArray = new Float32Array(dataBuffer);
+    if (!littleEndian) swapEndian32(typedArray);
+  } else if (typeChar === 'f' && byteSize === 8) {
+    typedArray = new Float64Array(dataBuffer);
+    if (!littleEndian) swapEndian64(typedArray);
+  } else {
+    throw new Error("Unsupported dtype: " + descr);
+  }
+
+  return { shape, dtype: descr, data: typedArray, fortranOrder };
+}
+
+function swapEndian16(arr) {
+  const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  for (let i = 0; i < bytes.length; i += 2) {
+    const t = bytes[i]; bytes[i] = bytes[i+1]; bytes[i+1] = t;
+  }
+}
+
+function swapEndian32(arr) {
+  const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  for (let i = 0; i < bytes.length; i += 4) {
+    let t = bytes[i]; bytes[i] = bytes[i+3]; bytes[i+3] = t;
+    t = bytes[i+1]; bytes[i+1] = bytes[i+2]; bytes[i+2] = t;
+  }
+}
+
+function swapEndian64(arr) {
+  const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  for (let i = 0; i < bytes.length; i += 8) {
+    for (let j = 0; j < 4; j++) {
+      const t = bytes[i+j]; bytes[i+j] = bytes[i+7-j]; bytes[i+7-j] = t;
+    }
+  }
+}
+
+// ==================== STATE ====================
+
+const state = {
+  // Raw npy data
+  bands: null,       // {shape, data}
+  masks: null,
+  doys: null,
+  maskOptimized: null,
+  sarAsc: null,
+  sarAscDoy: null,
+  sarDesc: null,
+  sarDescDoy: null,
+
+  // View state
+  composite: 'true',  // 'true', 'fci', 'swir', 'ndvi', 'sar-vv', 'sar-vh'
+  showMaskScl: false,
+  showMaskOcm: false,
+  timestep: 0,
+  sarTimestep: 0,
+  sarMode: 'ascending', // which sar dataset to show
+
+  // Stretch
+  stretchMin: 0,
+  stretchMax: 3000,
+
+  // Canvas transform
+  scale: 1,
+  panX: 0,
+  panY: 0,
+
+  // Derived
+  width: 0,
+  height: 0,
+  numTimesteps: 0,
+  sarAscTimesteps: 0,
+  sarDescTimesteps: 0,
+
+  // Loaded files
+  loadedFiles: [],
+};
+
+// ==================== DOM REFS ====================
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const canvasArea = document.getElementById('canvas-area');
+const pixelInfo = document.getElementById('pixel-info');
+const timelineCanvas = document.getElementById('timeline-canvas');
+const timelineCtx = timelineCanvas.getContext('2d');
+const slider = document.getElementById('timestep-slider');
+
+// ==================== FILE LOADING ====================
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const browseBtn = document.getElementById('browse-btn');
+
+browseBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
+
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.classList.add('drag-over');
+});
+dropZone.addEventListener('dragleave', () => {
+  dropZone.classList.remove('drag-over');
+});
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  // Handle both folder drops and file drops
+  const items = e.dataTransfer.items;
+  if (items && items.length > 0) {
+    const entries = [];
+    const promises = [];
+    for (let i = 0; i < items.length; i++) {
+      const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+      if (entry) {
+        if (entry.isDirectory) {
+          promises.push(readDirectory(entry));
+        } else {
+          promises.push(readFileEntry(entry));
+        }
+      }
+    }
+    if (promises.length > 0) {
+      Promise.all(promises).then(results => {
+        const files = results.flat();
+        handleFileObjects(files);
+      });
+      return;
+    }
+  }
+  // Fallback to files
+  handleFiles(e.dataTransfer.files);
+});
+
+function readDirectory(dirEntry) {
+  return new Promise((resolve) => {
+    const reader = dirEntry.createReader();
+    const allEntries = [];
+    function readBatch() {
+      reader.readEntries((entries) => {
+        if (entries.length === 0) {
+          // Now read all file entries
+          const filePromises = allEntries
+            .filter(e => e.isFile && e.name.endsWith('.npy'))
+            .map(e => readFileEntry(e));
+          Promise.all(filePromises).then(resolve);
+        } else {
+          // Check for subdirectories too (dpixel dirs may have grid_* subdirs)
+          for (const entry of entries) {
+            if (entry.isFile && entry.name.endsWith('.npy')) {
+              allEntries.push(entry);
+            } else if (entry.isDirectory) {
+              // We only go one level deep for simplicity
+            }
+          }
+          readBatch();
+        }
+      });
+    }
+    readBatch();
+  });
+}
+
+function readFileEntry(entry) {
+  return new Promise((resolve) => {
+    entry.file(f => resolve(f));
+  });
+}
+
+function handleFiles(fileList) {
+  const files = [];
+  for (let i = 0; i < fileList.length; i++) {
+    if (fileList[i].name.endsWith('.npy')) {
+      files.push(fileList[i]);
+    }
+  }
+  handleFileObjects(files);
+}
+
+async function handleFileObjects(files) {
+  if (files.length === 0) {
+    alert('No .npy files found. Please drop a dpixel output directory.');
+    return;
+  }
+
+  state.loadedFiles = [];
+  const nameMap = {};
+  for (const f of files) {
+    nameMap[f.name.toLowerCase()] = f;
+  }
+
+  const targets = {
+    'bands.npy': 'bands',
+    'masks.npy': 'masks',
+    'doys.npy': 'doys',
+    'mask_optimized.npy': 'maskOptimized',
+    'sar_ascending.npy': 'sarAsc',
+    'sar_ascending_doy.npy': 'sarAscDoy',
+    'sar_descending.npy': 'sarDesc',
+    'sar_descending_doy.npy': 'sarDescDoy',
+  };
+
+  for (const [filename, key] of Object.entries(targets)) {
+    const file = nameMap[filename];
+    if (file) {
+      try {
+        const buf = await file.arrayBuffer();
+        state[key] = parseNpy(buf);
+        state.loadedFiles.push(filename + ' ' + JSON.stringify(state[key].shape) + ' ' + state[key].dtype);
+      } catch (e) {
+        console.error('Error parsing ' + filename + ':', e);
+        state.loadedFiles.push(filename + ' ERROR: ' + e.message);
+      }
+    }
+  }
+
+  if (!state.bands) {
+    alert('bands.npy is required but was not found.');
+    return;
+  }
+
+  // Derive dimensions
+  const s = state.bands.shape;
+  state.numTimesteps = s[0];
+  state.height = s[1];
+  state.width = s[2];
+  state.timestep = 0;
+
+  if (state.sarAsc) state.sarAscTimesteps = state.sarAsc.shape[0];
+  if (state.sarDesc) state.sarDescTimesteps = state.sarDesc.shape[0];
+  state.sarTimestep = 0;
+
+  // Set slider
+  slider.max = state.numTimesteps - 1;
+  slider.value = 0;
+
+  // Auto stretch
+  autoStretch();
+
+  // Show UI
+  dropZone.classList.add('hidden');
+  document.getElementById('toolbar').style.display = 'flex';
+  document.getElementById('main').style.display = 'flex';
+  document.getElementById('slider-row').style.display = 'flex';
+  document.getElementById('timeline').style.display = 'block';
+
+  updateInfoPanel();
+  fitToView();
+  drawTimeline();
+}
+
+// ==================== COMPOSITE RENDERING ====================
+
+function setComposite(comp) {
+  state.composite = comp;
+  // Update active button
+  document.querySelectorAll('#toolbar .group:first-child button').forEach(b => b.classList.remove('active'));
+  const btnId = {
+    'true': 'btn-true-color', 'fci': 'btn-fci', 'swir': 'btn-swir',
+    'ndvi': 'btn-ndvi', 'sar-vv': 'btn-sar-vv', 'sar-vh': 'btn-sar-vh'
+  }[comp];
+  if (btnId) document.getElementById(btnId).classList.add('active');
+
+  // Switch slider range for SAR vs S2
+  if (comp === 'sar-vv' || comp === 'sar-vh') {
+    const sarData = state.sarAsc || state.sarDesc;
+    if (sarData) {
+      const maxT = (state.sarAsc ? state.sarAscTimesteps : 0) + (state.sarDesc ? state.sarDescTimesteps : 0) - 1;
+      slider.max = Math.max(0, maxT);
+      state.sarTimestep = Math.min(state.sarTimestep, parseInt(slider.max));
+      slider.value = state.sarTimestep;
+    }
+  } else {
+    slider.max = Math.max(0, state.numTimesteps - 1);
+    slider.value = state.timestep;
+  }
+
+  updateSliderLabel();
+  render();
+}
+
+function toggleMask(which) {
+  if (which === 'scl') {
+    state.showMaskScl = !state.showMaskScl;
+    document.getElementById('btn-mask-scl').classList.toggle('active', state.showMaskScl);
+  } else {
+    state.showMaskOcm = !state.showMaskOcm;
+    document.getElementById('btn-mask-ocm').classList.toggle('active', state.showMaskOcm);
+  }
+  render();
+}
+
+function applyStretch() {
+  state.stretchMin = parseInt(document.getElementById('stretch-min').value) || 0;
+  state.stretchMax = parseInt(document.getElementById('stretch-max').value) || 3000;
+  render();
+}
+
+function autoStretch() {
+  if (!state.bands) return;
+  const comp = state.composite;
+  if (comp === 'sar-vv' || comp === 'sar-vh') {
+    // SAR auto stretch
+    const sarData = getSarDataForCurrentTimestep();
+    if (!sarData) return;
+    const channel = comp === 'sar-vv' ? 0 : 1;
+    const { data, shape, t } = sarData;
+    const H = shape[1], W = shape[2];
+    const frameSize = H * W * 2;
+    const offset = t * frameSize;
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < H * W; i++) {
+      const v = data[offset + i * 2 + channel];
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    state.stretchMin = min;
+    state.stretchMax = max;
+  } else {
+    // S2 auto stretch: sample the current frame to find p2/p98
+    const T = state.timestep;
+    const H = state.height, W = state.width;
+    const bands = state.bands.data;
+    const numBands = state.bands.shape[3];
+    const frameSize = H * W * numBands;
+    const offset = T * frameSize;
+    // Sample ~10000 pixels from RGB bands
+    const step = Math.max(1, Math.floor(H * W / 10000));
+    const vals = [];
+    const rgbIdx = [0, 1, 2]; // B04, B02, B03
+    for (let i = 0; i < H * W; i += step) {
+      for (const b of rgbIdx) {
+        vals.push(bands[offset + i * numBands + b]);
+      }
+    }
+    vals.sort((a, b) => a - b);
+    const p2 = vals[Math.floor(vals.length * 0.02)];
+    const p98 = vals[Math.floor(vals.length * 0.98)];
+    state.stretchMin = p2;
+    state.stretchMax = p98;
+  }
+  document.getElementById('stretch-min').value = state.stretchMin;
+  document.getElementById('stretch-max').value = state.stretchMax;
+  render();
+}
+
+function getSarDataForCurrentTimestep() {
+  const idx = state.sarTimestep;
+  const ascT = state.sarAscTimesteps;
+  const descT = state.sarDescTimesteps;
+  if (idx < ascT && state.sarAsc) {
+    return { data: state.sarAsc.data, shape: state.sarAsc.shape, t: idx, mode: 'ascending', doyArr: state.sarAscDoy };
+  } else if (state.sarDesc) {
+    return { data: state.sarDesc.data, shape: state.sarDesc.shape, t: idx - ascT, mode: 'descending', doyArr: state.sarDescDoy };
+  }
+  return null;
+}
+
+function renderFrame() {
+  const comp = state.composite;
+  const H = state.height;
+  const W = state.width;
+
+  if (comp === 'sar-vv' || comp === 'sar-vh') {
+    return renderSarFrame(comp === 'sar-vv' ? 0 : 1);
+  }
+
+  const T = state.timestep;
+  const bands = state.bands.data;
+  const numBands = state.bands.shape[3];
+  const frameSize = H * W * numBands;
+  const offset = T * frameSize;
+  const sMin = state.stretchMin;
+  const sMax = state.stretchMax;
+  const range = sMax - sMin || 1;
+
+  const imgData = new ImageData(W, H);
+  const pixels = imgData.data;
+
+  // Band indices: B04=0, B02=1, B03=2, B08=3, B8A=4, B05=5, B06=6, B07=7, B11=8, B12=9
+  let rIdx, gIdx, bIdx;
+  let isNdvi = false;
+  if (comp === 'true') {
+    rIdx = 0; gIdx = 2; bIdx = 1; // R=B04, G=B03, B=B02
+  } else if (comp === 'fci') {
+    rIdx = 3; gIdx = 0; bIdx = 2; // R=B08, G=B04, B=B03
+  } else if (comp === 'swir') {
+    rIdx = 8; gIdx = 3; bIdx = 0; // R=B11, G=B08, B=B04
+  } else if (comp === 'ndvi') {
+    isNdvi = true;
+  }
+
+  for (let i = 0; i < H * W; i++) {
+    const base = offset + i * numBands;
+    let r, g, b;
+    if (isNdvi) {
+      const nir = bands[base + 3]; // B08
+      const red = bands[base + 0]; // B04
+      const ndvi = (nir + red) === 0 ? 0 : (nir - red) / (nir + red);
+      // Color ramp: -1 to 1
+      // Brown/red for negative, yellow for 0, green for positive
+      if (ndvi < 0) {
+        r = 180; g = 60 + Math.round(60 * (1 + ndvi)); b = 20;
+      } else if (ndvi < 0.2) {
+        const f = ndvi / 0.2;
+        r = 180 + Math.round(55 * f); g = 120 + Math.round(100 * f); b = 20;
+      } else if (ndvi < 0.5) {
+        const f = (ndvi - 0.2) / 0.3;
+        r = Math.round(235 * (1 - f)); g = 220; b = 20;
+      } else {
+        const f = Math.min(1, (ndvi - 0.5) / 0.5);
+        r = Math.round(30 * (1 - f)); g = Math.round(220 - 80 * f); b = Math.round(20 + 40 * f);
+      }
+    } else {
+      r = Math.round(((bands[base + rIdx] - sMin) / range) * 255);
+      g = Math.round(((bands[base + gIdx] - sMin) / range) * 255);
+      b = Math.round(((bands[base + bIdx] - sMin) / range) * 255);
+      r = Math.max(0, Math.min(255, r));
+      g = Math.max(0, Math.min(255, g));
+      b = Math.max(0, Math.min(255, b));
+    }
+
+    pixels[i * 4] = r;
+    pixels[i * 4 + 1] = g;
+    pixels[i * 4 + 2] = b;
+    pixels[i * 4 + 3] = 255;
+  }
+
+  // Mask overlays
+  if (state.showMaskScl && state.masks) {
+    const maskData = state.masks.data;
+    const maskH = state.masks.shape[1];
+    const maskW = state.masks.shape[2];
+    const maskOffset = T * maskH * maskW;
+    if (maskH === H && maskW === W) {
+      for (let i = 0; i < H * W; i++) {
+        if (maskData[maskOffset + i] === 0) {
+          // Cloud: semi-transparent red
+          pixels[i * 4] = Math.round(pixels[i * 4] * 0.5 + 220 * 0.5);
+          pixels[i * 4 + 1] = Math.round(pixels[i * 4 + 1] * 0.5 + 40 * 0.5);
+          pixels[i * 4 + 2] = Math.round(pixels[i * 4 + 2] * 0.5 + 40 * 0.5);
+        }
+      }
+    }
+  }
+  if (state.showMaskOcm && state.maskOptimized) {
+    const maskData = state.maskOptimized.data;
+    const maskH = state.maskOptimized.shape[1];
+    const maskW = state.maskOptimized.shape[2];
+    const maskOffset = T * maskH * maskW;
+    if (maskH === H && maskW === W) {
+      for (let i = 0; i < H * W; i++) {
+        if (maskData[maskOffset + i] === 0) {
+          // Cloud: semi-transparent orange
+          pixels[i * 4] = Math.round(pixels[i * 4] * 0.5 + 255 * 0.5);
+          pixels[i * 4 + 1] = Math.round(pixels[i * 4 + 1] * 0.5 + 140 * 0.5);
+          pixels[i * 4 + 2] = Math.round(pixels[i * 4 + 2] * 0.5 + 0 * 0.5);
+        }
+      }
+    }
+  }
+
+  return imgData;
+}
+
+function renderSarFrame(channel) {
+  const sarInfo = getSarDataForCurrentTimestep();
+  if (!sarInfo) return new ImageData(1, 1);
+
+  const { data, shape, t } = sarInfo;
+  const H = shape[1], W = shape[2];
+  const frameSize = H * W * 2;
+  const offset = t * frameSize;
+  const sMin = state.stretchMin;
+  const sMax = state.stretchMax;
+  const range = sMax - sMin || 1;
+
+  const imgData = new ImageData(W, H);
+  const pixels = imgData.data;
+
+  for (let i = 0; i < H * W; i++) {
+    const v = data[offset + i * 2 + channel];
+    let gray = Math.round(((v - sMin) / range) * 255);
+    gray = Math.max(0, Math.min(255, gray));
+    pixels[i * 4] = gray;
+    pixels[i * 4 + 1] = gray;
+    pixels[i * 4 + 2] = gray;
+    pixels[i * 4 + 3] = 255;
+  }
+
+  return imgData;
+}
+
+// ==================== CANVAS RENDERING ====================
+
+let offscreenCanvas = null;
+let offscreenCtx = null;
+
+function render() {
+  if (!state.bands) return;
+
+  const imgData = renderFrame();
+  const iw = imgData.width;
+  const ih = imgData.height;
+
+  // Create offscreen canvas at image size
+  if (!offscreenCanvas || offscreenCanvas.width !== iw || offscreenCanvas.height !== ih) {
+    offscreenCanvas = document.createElement('canvas');
+    offscreenCanvas.width = iw;
+    offscreenCanvas.height = ih;
+    offscreenCtx = offscreenCanvas.getContext('2d');
+  }
+  offscreenCtx.putImageData(imgData, 0, 0);
+
+  drawCanvas();
+  updateInfoPanel();
+  updateSliderLabel();
+  drawTimeline();
+}
+
+function drawCanvas() {
+  if (!offscreenCanvas) return;
+  const cw = canvasArea.clientWidth;
+  const ch = canvasArea.clientHeight;
+  canvas.width = cw;
+  canvas.height = ch;
+
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, cw, ch);
+
+  ctx.save();
+  ctx.translate(state.panX, state.panY);
+  ctx.scale(state.scale, state.scale);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(offscreenCanvas, 0, 0);
+  ctx.restore();
+
+  document.getElementById('zoom-label').textContent = (state.scale * 100).toFixed(0) + '%';
+}
+
+function fitToView() {
+  if (!state.bands) return;
+  const cw = canvasArea.clientWidth;
+  const ch = canvasArea.clientHeight;
+  // For SAR, use SAR dimensions
+  let iw, ih;
+  if ((state.composite === 'sar-vv' || state.composite === 'sar-vh')) {
+    const sarInfo = getSarDataForCurrentTimestep();
+    if (sarInfo) {
+      ih = sarInfo.shape[1]; iw = sarInfo.shape[2];
+    } else {
+      iw = state.width; ih = state.height;
+    }
+  } else {
+    iw = state.width; ih = state.height;
+  }
+  const scaleX = cw / iw;
+  const scaleY = ch / ih;
+  state.scale = Math.min(scaleX, scaleY) * 0.95;
+  state.panX = (cw - iw * state.scale) / 2;
+  state.panY = (ch - ih * state.scale) / 2;
+  render();
+}
+
+function zoomTo(z) {
+  const cw = canvasArea.clientWidth;
+  const ch = canvasArea.clientHeight;
+  const cx = cw / 2, cy = ch / 2;
+  state.panX = cx - (cx - state.panX) * (z / state.scale);
+  state.panY = cy - (cy - state.panY) * (z / state.scale);
+  state.scale = z;
+  render();
+}
+
+// ==================== PAN & ZOOM ====================
+
+let dragging = false, lastMX = 0, lastMY = 0;
+
+canvasArea.addEventListener('mousedown', (e) => {
+  dragging = true;
+  lastMX = e.clientX;
+  lastMY = e.clientY;
+});
+window.addEventListener('mousemove', (e) => {
+  if (!dragging) return;
+  state.panX += e.clientX - lastMX;
+  state.panY += e.clientY - lastMY;
+  lastMX = e.clientX;
+  lastMY = e.clientY;
+  drawCanvas();
+});
+window.addEventListener('mouseup', () => { dragging = false; });
+
+canvasArea.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = canvasArea.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  state.panX = mx - (mx - state.panX) * factor;
+  state.panY = my - (my - state.panY) * factor;
+  state.scale *= factor;
+  drawCanvas();
+}, { passive: false });
+
+// ==================== PIXEL HOVER ====================
+
+canvasArea.addEventListener('mousemove', (e) => {
+  if (dragging || !state.bands) return;
+  const rect = canvasArea.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const imgX = Math.floor((mx - state.panX) / state.scale);
+  const imgY = Math.floor((my - state.panY) / state.scale);
+
+  const isSar = state.composite === 'sar-vv' || state.composite === 'sar-vh';
+  let W, H;
+  if (isSar) {
+    const sarInfo = getSarDataForCurrentTimestep();
+    if (!sarInfo) { pixelInfo.style.display = 'none'; return; }
+    W = sarInfo.shape[2]; H = sarInfo.shape[1];
+  } else {
+    W = state.width; H = state.height;
+  }
+
+  if (imgX < 0 || imgX >= W || imgY < 0 || imgY >= H) {
+    pixelInfo.style.display = 'none';
+    document.getElementById('info-pixel').innerHTML = '<div class="row"><span class="key">Hover over image</span></div>';
+    return;
+  }
+
+  let text = 'x=' + imgX + ' y=' + imgY + '\n';
+  let infoHtml = '';
+  infoHtml += '<div class="row"><span class="key">Position</span><span class="val">' + imgX + ', ' + imgY + '</span></div>';
+
+  if (isSar) {
+    const sarInfo = getSarDataForCurrentTimestep();
+    const { data, shape, t } = sarInfo;
+    const frameSize = shape[1] * shape[2] * 2;
+    const pixelIdx = t * frameSize + (imgY * shape[2] + imgX) * 2;
+    const vv = data[pixelIdx];
+    const vh = data[pixelIdx + 1];
+    text += 'VV=' + vv + ' VH=' + vh;
+    infoHtml += '<div class="row"><span class="key">VV</span><span class="val">' + vv + '</span></div>';
+    infoHtml += '<div class="row"><span class="key">VH</span><span class="val">' + vh + '</span></div>';
+  } else {
+    const T = state.timestep;
+    const numBands = state.bands.shape[3];
+    const base = T * H * W * numBands + (imgY * W + imgX) * numBands;
+    const bandNames = ['B04', 'B02', 'B03', 'B08', 'B8A', 'B05', 'B06', 'B07', 'B11', 'B12'];
+    for (let b = 0; b < Math.min(numBands, 10); b++) {
+      const v = state.bands.data[base + b];
+      text += bandNames[b] + '=' + v + ' ';
+      infoHtml += '<div class="row"><span class="key">' + bandNames[b] + '</span><span class="val">' + v + '</span></div>';
+    }
+    // Mask values
+    if (state.masks) {
+      const mv = state.masks.data[T * H * W + imgY * W + imgX];
+      text += '\nSCL mask=' + mv;
+      infoHtml += '<div class="row"><span class="key">SCL mask</span><span class="val">' + (mv ? 'clear' : 'cloud') + '</span></div>';
+    }
+    if (state.maskOptimized) {
+      const mv = state.maskOptimized.data[T * H * W + imgY * W + imgX];
+      text += ' OCM mask=' + mv;
+      infoHtml += '<div class="row"><span class="key">OCM mask</span><span class="val">' + (mv ? 'clear' : 'cloud') + '</span></div>';
+    }
+  }
+
+  document.getElementById('info-pixel').innerHTML = infoHtml;
+
+  pixelInfo.textContent = text;
+  pixelInfo.style.display = 'block';
+  pixelInfo.style.left = (mx + 15) + 'px';
+  pixelInfo.style.top = (my + 15) + 'px';
+  // Keep tooltip on screen
+  const piRect = pixelInfo.getBoundingClientRect();
+  const areaRect = canvasArea.getBoundingClientRect();
+  if (piRect.right > areaRect.right) {
+    pixelInfo.style.left = (mx - piRect.width - 10) + 'px';
+  }
+  if (piRect.bottom > areaRect.bottom) {
+    pixelInfo.style.top = (my - piRect.height - 10) + 'px';
+  }
+});
+
+canvasArea.addEventListener('mouseleave', () => {
+  pixelInfo.style.display = 'none';
+});
+
+// ==================== KEYBOARD & SLIDER ====================
+
+slider.addEventListener('input', () => {
+  const val = parseInt(slider.value);
+  if (state.composite === 'sar-vv' || state.composite === 'sar-vh') {
+    state.sarTimestep = val;
+  } else {
+    state.timestep = val;
+  }
+  render();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (!state.bands) return;
+  const isSar = state.composite === 'sar-vv' || state.composite === 'sar-vh';
+
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    e.preventDefault();
+    const delta = e.key === 'ArrowLeft' ? -1 : 1;
+    if (isSar) {
+      const maxT = (state.sarAscTimesteps + state.sarDescTimesteps) - 1;
+      state.sarTimestep = Math.max(0, Math.min(maxT, state.sarTimestep + delta));
+      slider.value = state.sarTimestep;
+    } else {
+      state.timestep = Math.max(0, Math.min(state.numTimesteps - 1, state.timestep + delta));
+      slider.value = state.timestep;
+    }
+    render();
+  }
+
+  // Number keys 1-6 for composites
+  if (e.key === '1') setComposite('true');
+  if (e.key === '2') setComposite('fci');
+  if (e.key === '3') setComposite('swir');
+  if (e.key === '4') setComposite('ndvi');
+  if (e.key === '5') setComposite('sar-vv');
+  if (e.key === '6') setComposite('sar-vh');
+  if (e.key === 'm') toggleMask('scl');
+  if (e.key === 'o') toggleMask('ocm');
+  if (e.key === 'a') autoStretch();
+  if (e.key === 'f') fitToView();
+});
+
+// ==================== INFO PANEL ====================
+
+function doyToDate(doy, year) {
+  if (!year) year = 2024; // default
+  const d = new Date(year, 0, 1);
+  d.setDate(doy);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[d.getMonth()] + ' ' + d.getDate();
+}
+
+function updateSliderLabel() {
+  const isSar = state.composite === 'sar-vv' || state.composite === 'sar-vh';
+  if (isSar) {
+    const totalSar = state.sarAscTimesteps + state.sarDescTimesteps;
+    const sarInfo = getSarDataForCurrentTimestep();
+    const doyLabel = document.getElementById('doy-label');
+    const dateLabel = document.getElementById('date-label');
+    document.getElementById('slider-label').textContent = 'SAR: ' + (state.sarTimestep + 1) + '/' + totalSar;
+    if (sarInfo && sarInfo.doyArr) {
+      const doy = sarInfo.doyArr.data[sarInfo.t];
+      doyLabel.textContent = 'DOY: ' + doy;
+      dateLabel.textContent = '(' + doyToDate(Math.abs(doy)) + ') ' + sarInfo.mode;
+    } else {
+      doyLabel.textContent = 'DOY: --';
+      dateLabel.textContent = '';
+    }
+  } else {
+    document.getElementById('slider-label').textContent = 'T: ' + (state.timestep + 1) + '/' + state.numTimesteps;
+    if (state.doys) {
+      const doy = state.doys.data[state.timestep];
+      document.getElementById('doy-label').textContent = 'DOY: ' + doy;
+      document.getElementById('date-label').textContent = '(' + doyToDate(doy) + ')';
+    } else {
+      document.getElementById('doy-label').textContent = 'DOY: --';
+      document.getElementById('date-label').textContent = '';
+    }
+  }
+}
+
+function updateInfoPanel() {
+  const dataHtml = [
+    row('Dimensions', state.width + ' x ' + state.height),
+    row('S2 timesteps', state.numTimesteps),
+    row('SAR asc T', state.sarAscTimesteps),
+    row('SAR desc T', state.sarDescTimesteps),
+    row('Bands', state.bands ? state.bands.shape[3] : '--'),
+  ].join('');
+  document.getElementById('info-data').innerHTML = dataHtml;
+
+  const isSar = state.composite === 'sar-vv' || state.composite === 'sar-vh';
+  let frameHtml;
+  if (isSar) {
+    const sarInfo = getSarDataForCurrentTimestep();
+    frameHtml = [
+      row('Composite', state.composite.toUpperCase()),
+      row('SAR timestep', (state.sarTimestep + 1) + '/' + (state.sarAscTimesteps + state.sarDescTimesteps)),
+      row('Mode', sarInfo ? sarInfo.mode : '--'),
+      row('DOY', sarInfo && sarInfo.doyArr ? sarInfo.doyArr.data[sarInfo.t] : '--'),
+      row('Stretch', state.stretchMin + ' - ' + state.stretchMax),
+    ].join('');
+  } else {
+    const doy = state.doys ? state.doys.data[state.timestep] : '--';
+    const compNames = {
+      'true': 'True Color (R=B04 G=B03 B=B02)',
+      'fci': 'False Color IR (R=B08 G=B04 B=B03)',
+      'swir': 'SWIR (R=B11 G=B08 B=B04)',
+      'ndvi': 'NDVI',
+    };
+    frameHtml = [
+      row('Composite', compNames[state.composite] || state.composite),
+      row('Timestep', (state.timestep + 1) + '/' + state.numTimesteps),
+      row('DOY', doy),
+      row('Date (approx)', doy !== '--' ? doyToDate(doy) : '--'),
+      row('Stretch', state.stretchMin + ' - ' + state.stretchMax),
+      row('Masks', (state.showMaskScl ? 'SCL ' : '') + (state.showMaskOcm ? 'OCM' : '') || 'none'),
+    ].join('');
+  }
+  document.getElementById('info-frame').innerHTML = frameHtml;
+
+  document.getElementById('info-files').innerHTML = state.loadedFiles.map(f =>
+    '<div style="font-size:10px;color:#8899aa;padding:1px 0;font-family:monospace;word-break:break-all;">' + f + '</div>'
+  ).join('');
+}
+
+function row(key, val) {
+  return '<div class="row"><span class="key">' + key + '</span><span class="val">' + val + '</span></div>';
+}
+
+// ==================== TIMELINE ====================
+
+function drawTimeline() {
+  const tc = timelineCanvas;
+  const rect = tc.parentElement.getBoundingClientRect();
+  tc.width = rect.width;
+  tc.height = rect.height;
+  const w = tc.width;
+  const h = tc.height;
+  const tCtx = timelineCtx;
+
+  tCtx.fillStyle = '#16213e';
+  tCtx.fillRect(0, 0, w, h);
+
+  // Determine DOY range
+  let minDoy = 1, maxDoy = 366;
+  const allDoys = [];
+  if (state.doys) for (let i = 0; i < state.doys.data.length; i++) allDoys.push(state.doys.data[i]);
+  if (state.sarAscDoy) for (let i = 0; i < state.sarAscDoy.data.length; i++) allDoys.push(Math.abs(state.sarAscDoy.data[i]));
+  if (state.sarDescDoy) for (let i = 0; i < state.sarDescDoy.data.length; i++) allDoys.push(Math.abs(state.sarDescDoy.data[i]));
+  if (allDoys.length > 0) {
+    minDoy = Math.max(1, Math.min(...allDoys) - 5);
+    maxDoy = Math.min(366, Math.max(...allDoys) + 5);
+  }
+
+  const margin = 40;
+  const plotW = w - margin * 2;
+  const doyRange = maxDoy - minDoy || 1;
+
+  function doyToX(doy) {
+    return margin + ((doy - minDoy) / doyRange) * plotW;
+  }
+
+  // Draw month labels
+  tCtx.fillStyle = '#556677';
+  tCtx.font = '10px monospace';
+  tCtx.textAlign = 'center';
+  const monthStarts = [1,32,60,91,121,152,182,213,244,274,305,335];
+  const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  for (let i = 0; i < 12; i++) {
+    const doy = monthStarts[i];
+    if (doy >= minDoy && doy <= maxDoy) {
+      const x = doyToX(doy);
+      tCtx.strokeStyle = '#1a2a44';
+      tCtx.beginPath(); tCtx.moveTo(x, 0); tCtx.lineTo(x, h); tCtx.stroke();
+      tCtx.fillText(monthNames[i], x + 12, h - 4);
+    }
+  }
+
+  // Draw S2 ticks
+  const rowY = {s2: 16, sarAsc: 34, sarDesc: 52};
+  const rowH = 12;
+
+  // Labels
+  tCtx.fillStyle = '#8899aa';
+  tCtx.textAlign = 'right';
+  tCtx.font = '10px monospace';
+  tCtx.fillText('S2', margin - 4, rowY.s2 + 9);
+  tCtx.fillText('S1 Asc', margin - 4, rowY.sarAsc + 9);
+  tCtx.fillText('S1 Desc', margin - 4, rowY.sarDesc + 9);
+
+  // S2 ticks
+  if (state.doys) {
+    for (let i = 0; i < state.doys.data.length; i++) {
+      const doy = state.doys.data[i];
+      const x = doyToX(doy);
+      const isCurrent = (state.composite !== 'sar-vv' && state.composite !== 'sar-vh') && i === state.timestep;
+      tCtx.fillStyle = isCurrent ? '#e94560' : '#4a90d9';
+      tCtx.fillRect(x - 1, rowY.s2, isCurrent ? 3 : 2, rowH);
+    }
+  }
+
+  // SAR ascending ticks
+  if (state.sarAscDoy) {
+    for (let i = 0; i < state.sarAscDoy.data.length; i++) {
+      const doy = Math.abs(state.sarAscDoy.data[i]);
+      const x = doyToX(doy);
+      const isCurrent = (state.composite === 'sar-vv' || state.composite === 'sar-vh') && state.sarTimestep === i;
+      tCtx.fillStyle = isCurrent ? '#e94560' : '#50c878';
+      tCtx.fillRect(x - 1, rowY.sarAsc, isCurrent ? 3 : 2, rowH);
+    }
+  }
+
+  // SAR descending ticks
+  if (state.sarDescDoy) {
+    for (let i = 0; i < state.sarDescDoy.data.length; i++) {
+      const doy = Math.abs(state.sarDescDoy.data[i]);
+      const x = doyToX(doy);
+      const isCurrent = (state.composite === 'sar-vv' || state.composite === 'sar-vh') && state.sarTimestep === (state.sarAscTimesteps + i);
+      tCtx.fillStyle = isCurrent ? '#e94560' : '#f0a030';
+      tCtx.fillRect(x - 1, rowY.sarDesc, isCurrent ? 3 : 2, rowH);
+    }
+  }
+}
+
+// Timeline click to jump to timestep
+timelineCanvas.addEventListener('click', (e) => {
+  if (!state.doys && !state.sarAscDoy && !state.sarDescDoy) return;
+
+  const rect = timelineCanvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const w = timelineCanvas.width;
+  const margin = 40;
+  const plotW = w - margin * 2;
+
+  const allDoys = [];
+  if (state.doys) for (let i = 0; i < state.doys.data.length; i++) allDoys.push(state.doys.data[i]);
+  if (state.sarAscDoy) for (let i = 0; i < state.sarAscDoy.data.length; i++) allDoys.push(Math.abs(state.sarAscDoy.data[i]));
+  if (state.sarDescDoy) for (let i = 0; i < state.sarDescDoy.data.length; i++) allDoys.push(Math.abs(state.sarDescDoy.data[i]));
+  if (allDoys.length === 0) return;
+
+  let minDoy = Math.max(1, Math.min(...allDoys) - 5);
+  let maxDoy = Math.min(366, Math.max(...allDoys) + 5);
+  const doyRange = maxDoy - minDoy || 1;
+
+  const clickDoy = minDoy + ((mx - margin) / plotW) * doyRange;
+
+  // Determine which row was clicked
+  const rowRanges = { s2: [10, 28], sarAsc: [28, 46], sarDesc: [46, 64] };
+
+  if (my >= rowRanges.s2[0] && my < rowRanges.s2[1] && state.doys) {
+    // Find nearest S2 timestep
+    let bestIdx = 0, bestDist = Infinity;
+    for (let i = 0; i < state.doys.data.length; i++) {
+      const d = Math.abs(state.doys.data[i] - clickDoy);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    if (state.composite === 'sar-vv' || state.composite === 'sar-vh') {
+      setComposite('true');
+    }
+    state.timestep = bestIdx;
+    slider.max = state.numTimesteps - 1;
+    slider.value = bestIdx;
+    render();
+  } else if (my >= rowRanges.sarAsc[0] && my < rowRanges.sarAsc[1] && state.sarAscDoy) {
+    let bestIdx = 0, bestDist = Infinity;
+    for (let i = 0; i < state.sarAscDoy.data.length; i++) {
+      const d = Math.abs(Math.abs(state.sarAscDoy.data[i]) - clickDoy);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    if (state.composite !== 'sar-vv' && state.composite !== 'sar-vh') {
+      setComposite('sar-vv');
+    }
+    state.sarTimestep = bestIdx;
+    slider.max = state.sarAscTimesteps + state.sarDescTimesteps - 1;
+    slider.value = bestIdx;
+    render();
+  } else if (my >= rowRanges.sarDesc[0] && my < rowRanges.sarDesc[1] && state.sarDescDoy) {
+    let bestIdx = 0, bestDist = Infinity;
+    for (let i = 0; i < state.sarDescDoy.data.length; i++) {
+      const d = Math.abs(Math.abs(state.sarDescDoy.data[i]) - clickDoy);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    if (state.composite !== 'sar-vv' && state.composite !== 'sar-vh') {
+      setComposite('sar-vv');
+    }
+    state.sarTimestep = state.sarAscTimesteps + bestIdx;
+    slider.max = state.sarAscTimesteps + state.sarDescTimesteps - 1;
+    slider.value = state.sarTimestep;
+    render();
+  }
+});
+
+// ==================== RESIZE ====================
+
+window.addEventListener('resize', () => {
+  if (state.bands) {
+    drawCanvas();
+    drawTimeline();
+  }
+});
+
+</script>
+</body>
+</html>
