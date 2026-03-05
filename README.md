@@ -1,106 +1,88 @@
-# Tessera Minimal Pipeline
+# Tessera OCaml Pipeline
 
-A single-file reimplementation of the Tessera satellite imagery embedding pipeline. The original spans ~15 files across two codebases (preprocessing + inference); this consolidates everything into one `pipeline.py`.
+An OCaml implementation of the Tessera satellite imagery embedding pipeline. Downloads Sentinel-2 and Sentinel-1 data, preprocesses it (cloud masking, mosaicking, harmonisation), runs ONNX model inference, and outputs quantized int8 embeddings.
 
-## What it does
+Two tools are provided:
 
-1. **Downloads** Sentinel-2 (multispectral) and Sentinel-1 (SAR) satellite data from Microsoft Planetary Computer
-2. **Preprocesses** the data: cloud masking (SCL), tile selection mosaicking, harmonisation, amplitude-to-dB conversion
-3. **Runs inference** through a pretrained transformer model to produce 128-dimensional embeddings per pixel
-4. **Quantizes** to int8 with per-pixel symmetric scaling and saves as `.npy` files
+- **`bin/pipeline.ml`** — Full inference pipeline. Downloads Sentinel-2 and Sentinel-1 data per MGRS tile from Microsoft Planetary Computer (MPC) or AWS, processes spatial blocks, runs ONNX model inference, and outputs int8 embeddings.
+- **`bin/dpixel.ml`** — Download-only tool. Fetches S2 and S1 satellite data and writes intermediate "dpixel" `.npy` files (bands, masks, doys, SAR ascending/descending) without running inference.
+
+## Prerequisites
+
+- OCaml 5.3.0 with opam
+- GDAL (>= 3.10; 3.11+ recommended for Float16 support)
+- ONNX Runtime shared library (`libonnxruntime.so`)
+
+## External Repositories
+
+These libraries must be cloned and pinned locally via `opam pin`:
+
+| Library | Repository | Description |
+|---------|-----------|-------------|
+| `stac-client` | [mtelvers/stac-client](https://github.com/mtelvers/stac-client) | STAC API search + Planetary Computer token signing |
+| `gdal` | [mtelvers/ocaml-gdal](https://github.com/mtelvers/ocaml-gdal) | GDAL bindings (ctypes-based) |
+| `onnxruntime` | [mtelvers/ocaml-onnxruntime](https://github.com/mtelvers/ocaml-onnxruntime) | ONNX Runtime bindings (ctypes-based) |
+| `npy` | [mtelvers/ocaml-npy](https://github.com/mtelvers/ocaml-npy) | NumPy `.npy` file reader/writer |
+
+## Build
+
+```bash
+# Pin external dependencies (one-time setup)
+opam pin add stac-client https://github.com/mtelvers/stac-client.git -n
+opam pin add gdal https://github.com/mtelvers/ocaml-gdal.git -n
+opam pin add onnxruntime https://github.com/mtelvers/ocaml-onnxruntime.git -n
+opam pin add npy https://github.com/mtelvers/ocaml-npy.git -n
+opam install stac-client gdal onnxruntime npy
+
+# Build
+eval $(opam env)
+dune build bin/pipeline.exe
+dune build bin/dpixel.exe
+```
+
+Note: GDAL ctypes bindings require relaxed C flags. The `dune-workspace` is configured with `-Wno-incompatible-pointer-types` for this reason.
 
 ## Usage
 
+### pipeline.exe — Full inference
+
 ```bash
-# GPU (recommended)
-python pipeline.py \
-  --input_tiff global_map_0.1_degree_tiff/grid_51.05_10.35.tiff \
-  --checkpoint best_model_fsdp_20250608_220648_QAT.pt \
-  --output /tmp/embeddings/2024 \
-  --device cuda
-
-# CPU with multiple threads
-python pipeline.py \
-  --input_tiff global_map_0.1_degree_tiff/grid_51.05_10.35.tiff \
-  --checkpoint best_model_fsdp_20250608_220648_QAT.pt \
-  --output /tmp/embeddings/2024 \
-  --device cpu --num_threads 20
-
-# With caching (saves preprocessed data for resumable batch runs)
-python pipeline.py \
-  --input_tiff global_map_0.1_degree_tiff/grid_51.05_10.35.tiff \
-  --checkpoint best_model_fsdp_20250608_220648_QAT.pt \
-  --output /tmp/embeddings/2024 \
-  --cache_dir /tmp/dpixel_cache \
-  --device cuda
-
-# Skip download, use existing preprocessed data
-python pipeline.py \
-  --dpixel_dir /path/to/dpixel/grid_51.05_10.35 \
-  --checkpoint best_model_fsdp_20250608_220648_QAT.pt \
-  --output /tmp/embeddings/2024 \
-  --device cuda
+LD_LIBRARY_PATH=/path/to/onnxruntime/lib \
+dune exec bin/pipeline.exe -- \
+  --dpixel_dir /tmp/py_cache/grid_51.05_10.35 \
+  --model tessera_model.onnx \
+  --output /tmp/ocaml_out \
+  --batch_size 1024 \
+  --num_threads 20 \
+  --repeat_times 1
 ```
 
-## Options
+### dpixel.exe — Download only
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input_tiff` | | Grid GeoTIFF defining the ROI (region of interest) |
-| `--checkpoint` | | Path to model checkpoint `.pt` file |
-| `--output` | | Output directory for `.npy` files |
-| `--start` | 2024-01-01 | Start date for satellite data search |
-| `--end` | 2024-12-31 | End date for satellite data search |
-| `--max_cloud` | 100.0 | Max cloud cover % for Sentinel-2 STAC search |
-| `--device` | auto | `auto`, `cpu`, or `cuda` |
-| `--num_threads` | 1 | CPU threads (when device=cpu) |
-| `--batch_size` | 1024 | Inference batch size |
-| `--repeat_times` | 1 | Number of stratified sampling passes to average |
-| `--dpixel_dir` | | Load preprocessed `.npy` files instead of downloading |
-| `--cache_dir` | | Cache preprocessed data here; skips download on rerun |
-
-## Dependencies
-
-```
-torch
-numpy
-rasterio
-pystac-client
-planetary-computer
-stackstac
-pandas
+```bash
+dune exec bin/dpixel.exe -- \
+  --input_tiff global_map_0.1_degree_tiff/grid_51.05_10.35.tif \
+  --output /tmp/dpixel_cache \
+  --start 2024-01-01 \
+  --end 2024-12-31
 ```
 
-## Verification
+## Data Sources
 
-The pipeline has been verified to produce identical output to the original multi-file pipeline when run on the same preprocessed data (0 differences across 155 million values).
+- **Sentinel-2**: MPC (`planetarycomputer.microsoft.com`) or AWS (`earth-search.aws.element84.com`)
+- **Sentinel-1 (SAR)**: NASA OPERA RTC-S1 via CMR (`cmr.earthdata.nasa.gov`)
 
-When comparing end-to-end output against the published reference data (which used random sampling), the stratified deterministic sampling achieves:
+## DPixel Output Format
 
-- Mean cosine similarity: 0.943
-- 99.5% of pixels have cosine similarity > 0.9
-- Remaining differences are due to sampling strategy (deterministic vs random), not bugs
+The dpixel tool writes 7-8 `.npy` files per grid tile:
 
-### PCA visualisation
-
-PCA of the 128-dimensional embeddings projected to RGB for the test tile (grid_51.05_10.35 — coastal Somalia):
-
-| Published | Original pipeline | Minimal pipeline |
-|-----------|------------------|-----------------|
-| ![Published](npy-pca/pca_official.png) | ![Original](npy-pca/pca_original_pipeline.png) | ![Minimal](npy-pca/pca_minimal_pipeline.png) |
-
-## Input tiles
-
-The `--input_tiff` is a single-band uint8 GeoTIFF acting as a binary mask (0=skip, 1=process). It defines the spatial extent, CRS, and resolution for the satellite data download. The grid naming convention is `grid_{longitude}_{latitude}.tiff` at 0.1-degree spacing.
-
-## Performance
-
-On an NVIDIA L4 GPU (monteverde.cl.cam.ac.uk), processing grid_51.05_10.35 (269,908 valid pixels):
-
-| Phase | Time |
-|-------|------|
-| Download & preprocess | ~12 min |
-| Inference (GPU) | ~2.5 min |
-| **Total** | **~15 min** |
-
-Download time is dominated by the synchronous dask scheduler (required to work around a PROJ/rasterio threading issue).
+| File | Shape | Dtype | Description |
+|------|-------|-------|-------------|
+| `bands.npy` | (T,H,W,10) | uint16 | S2 spectral bands |
+| `masks.npy` | (T,H,W) | uint8 | SCL-derived validity masks |
+| `doys.npy` | (T,) | uint16 | Day-of-year for each S2 timestep |
+| `sar_ascending.npy` | (T,H,W,2) | int16 | S1 ascending VV+VH |
+| `sar_ascending_doy.npy` | (T,) | int16 | Day-of-year for ascending |
+| `sar_descending.npy` | (T,H,W,2) | int16 | S1 descending VV+VH |
+| `sar_descending_doy.npy` | (T,) | int16 | Day-of-year for descending |
+| `mask_optimized.npy` | (T,H,W) | uint8 | OmniCloudMask (optional) |

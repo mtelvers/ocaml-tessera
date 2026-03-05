@@ -1,0 +1,5 @@
+(lang dune 3.0)
+
+(env
+ (_
+  (c_flags (:standard -Wno-incompatible-pointer-types))))
