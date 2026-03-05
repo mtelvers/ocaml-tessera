@@ -57,7 +57,9 @@ dune exec bin/pipeline.exe -- \
   --repeat_times 1
 ```
 
-### dpixel.exe — Download only
+### dpixel.exe — Download and cloud masking
+
+Downloads Sentinel-2 and Sentinel-1 data for a GeoTIFF region of interest, applies cloud filtering, and optionally runs OmniCloudMask (ONNX ensemble) to produce optimised cloud masks.
 
 ```bash
 dune exec bin/dpixel.exe -- \
@@ -65,6 +67,50 @@ dune exec bin/dpixel.exe -- \
   --output /tmp/dpixel_cache \
   --start 2024-01-01 \
   --end 2024-12-31
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input_tiff` | (required) | GeoTIFF defining the ROI (any CRS, any size) |
+| `--output` | (required) | Output directory |
+| `--start` | `2024-01-01` | Start date (YYYY-MM-DD) |
+| `--end` | `2024-12-31` | End date (YYYY-MM-DD) |
+| `--data_source` | `mpc` | Data source: `mpc` (Planetary Computer) or `aws` |
+| `--download_workers` | `32` | Parallel GDAL download threads |
+| `--flat_output` | off | Write .npy files directly to `--output` (no subdirectory) |
+| `--max_cloud` | `100.0` | Max cloud cover % for scene filtering |
+| `--ocm_model_1` | `ocm_regnety_004.onnx` | Path to first OCM ONNX model |
+| `--ocm_model_2` | `ocm_edgenext_small.onnx` | Path to second OCM ONNX model |
+| `--ocm_patch_size` | `0` (auto) | OCM patch size in pixels |
+| `--ocm_batch_size` | `16` | OCM patches per inference batch |
+| `--ocm_patch_overlap` | `300` | OCM overlap pixels for blending |
+| `--ocm_threads` | `4` | ONNX Runtime threads for OCM |
+
+**OmniCloudMask:** If both `--ocm_model_1` and `--ocm_model_2` files exist, an ensemble cloud mask is generated and saved as `mask_optimized.npy`. The two ONNX models (`ocm_regnety_004.onnx` and `ocm_edgenext_small.onnx`) plus their `.onnx.data` files are required. Predictions from both models are averaged before argmax classification (0=clear, 1=cloud).
+
+**Resampling:** S2 spectral bands use cubic resampling, SCL masks and S1 SAR use nearest — matching Frank's Python pipeline.
+
+**Examples:**
+
+```bash
+# AWS data source with OmniCloudMask
+dune exec bin/dpixel.exe -- \
+  --input_tiff patch.tiff \
+  --output /tmp/output \
+  --start 2022-01-01 --end 2022-12-31 \
+  --data_source aws \
+  --flat_output \
+  --ocm_model_1 ocm_regnety_004.onnx \
+  --ocm_model_2 ocm_edgenext_small.onnx
+
+# Batch collection with GNU parallel (4 concurrent)
+parallel -j4 --colsep "\t" --timeout 600 \
+  ./dpixel.exe --input_tiff {1} --output {2} \
+    --start {3} --end {4} --data_source aws \
+    --flat_output --ocm_model_1 m1.onnx --ocm_model_2 m2.onnx \
+  :::: jobs.tsv
 ```
 
 ## Data Sources
