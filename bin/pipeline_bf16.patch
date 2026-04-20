@@ -1,0 +1,29 @@
+--- /home/mte24/tessera/pipeline.py	2026-02-22 14:53:39.304209115 +0000
++++ /home/mte24/tessera/pipeline_bf16.py	2026-04-08 14:11:51.366564439 +0000
+@@ -566,6 +566,7 @@
+                              "and reused on subsequent runs (enables resumable batch processing)")
+     parser.add_argument("--download_only", action="store_true",
+                         help="Only download and preprocess (requires --cache_dir). Skip inference.")
++    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 autocast")
+     args = parser.parse_args()
+ 
+     if args.download_only and not args.cache_dir:
+@@ -781,7 +782,8 @@
+     out_scales = np.zeros((H_actual * W_actual,), dtype=np.float32)
+     n_batches = (len(valid_pixels) + args.batch_size - 1) // args.batch_size
+ 
+-    with torch.no_grad():
++    autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16) if args.bf16 else torch.no_grad()
++    with torch.no_grad(), autocast_ctx:
+         for batch_idx in range(n_batches):
+             start = batch_idx * args.batch_size
+             end = min(start + args.batch_size, len(valid_pixels))
+@@ -807,7 +809,7 @@
+ 
+                 s2_tensor = torch.tensor(np.stack(s2_input_list), dtype=torch.float32, device=device)
+                 s1_tensor = torch.tensor(np.stack(s1_input_list), dtype=torch.float32, device=device)
+-                sum_z += model(s2_tensor, s1_tensor).cpu().numpy()
++                sum_z += model(s2_tensor, s1_tensor).float().cpu().numpy()
+ 
+             avg_z = sum_z / float(R)
+ 
