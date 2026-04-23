@@ -968,7 +968,7 @@ let run_ocm_on_image ~sess1 ~sess2 ~h ~w ~patch_size ~patch_overlap ~batch_size
   result
 
 (** Run OmniCloudMask on all timesteps. Returns flat (T*H*W) int array for mask_optimized. *)
-let run_ocm ~model1_path ~model2_path ~n_threads
+let run_ocm ~model1_path ~model2_path ~n_threads ~cuda_device
     ~patch_size ~patch_overlap ~batch_size
     ~(s2_bands_data : flat_4d) ~(s2_masks_data : flat_3d_int) =
   let n_t = s2_bands_data.n in
@@ -976,8 +976,9 @@ let run_ocm ~model1_path ~model2_path ~n_threads
   Printf.printf "  OCM: %d timesteps, %dx%d\n%!" n_t h w;
 
   let env = Onnxruntime.Env.create ~log_level:3 "ocm" in
-  let sess1 = Onnxruntime.Session.create env ~threads:n_threads model1_path in
-  let sess2 = Onnxruntime.Session.create env ~threads:n_threads model2_path in
+  let cuda_opt = if cuda_device >= 0 then Some cuda_device else None in
+  let sess1 = Onnxruntime.Session.create env ~threads:n_threads ?cuda_device:cuda_opt model1_path in
+  let sess2 = Onnxruntime.Session.create env ~threads:n_threads ?cuda_device:cuda_opt model2_path in
 
   (* Auto patch size *)
   let ps = if patch_size <= 0 then min 1000 (min h w) else patch_size in
@@ -1041,13 +1042,14 @@ let () =
   let max_cloud = ref 100.0 in
   let data_source_str = ref "mpc" in
   let download_workers = ref 32 in
-  let ocm_model_1 = ref "ocm_regnety_004.onnx" in
-  let ocm_model_2 = ref "ocm_edgenext_small.onnx" in
+  let ocm_model_1 = ref "" in
+  let ocm_model_2 = ref "" in
   let ocm_patch_size = ref 0 in
   let ocm_batch_size = ref 16 in
   let ocm_patch_overlap = ref 300 in
   let ocm_threads = ref 4 in
   let flat_output = ref false in
+  let cuda_device = ref (-1) in
 
   let speclist = [
     ("--input_tiff", Arg.Set_string input_tiff, "Path to grid GeoTIFF");
@@ -1057,13 +1059,14 @@ let () =
     ("--max_cloud", Arg.Set_float max_cloud, "Max cloud cover %");
     ("--data_source", Arg.Set_string data_source_str, "Data source: mpc or aws (default: mpc)");
     ("--download_workers", Arg.Set_int download_workers, "Parallel GDAL download workers (default: 32)");
-    ("--ocm_model_1", Arg.Set_string ocm_model_1, "Path to first OCM ONNX model");
-    ("--ocm_model_2", Arg.Set_string ocm_model_2, "Path to second OCM ONNX model");
+    ("--ocm_model_1", Arg.Set_string ocm_model_1, "Path to first OCM ONNX model (OCM skipped if not set)");
+    ("--ocm_model_2", Arg.Set_string ocm_model_2, "Path to second OCM ONNX model (OCM skipped if not set)");
     ("--ocm_patch_size", Arg.Set_int ocm_patch_size, "OCM patch size, 0=auto (default: 0)");
     ("--ocm_batch_size", Arg.Set_int ocm_batch_size, "OCM patches per batch (default: 16)");
     ("--ocm_patch_overlap", Arg.Set_int ocm_patch_overlap, "OCM overlap pixels (default: 300)");
     ("--ocm_threads", Arg.Set_int ocm_threads, "OCM ONNX Runtime threads (default: 4)");
     ("--flat_output", Arg.Set flat_output, "Write .npy files directly to --output (no subdirectory)");
+    ("--cuda", Arg.Set_int cuda_device, "CUDA device ID (e.g. 0) for GPU OCM inference");
   ] in
   Arg.parse speclist (fun _ -> ()) "Tessera dpixel download tool";
 
@@ -1178,8 +1181,12 @@ let () =
 
   Printf.printf "  Saved 7 .npy files\n%!";
 
-  (* OmniCloudMask *)
-  if Sys.file_exists !ocm_model_1 && Sys.file_exists !ocm_model_2 then begin
+  (* OmniCloudMask — only run if both model paths were supplied *)
+  if !ocm_model_1 <> "" && !ocm_model_2 <> "" then begin
+    if not (Sys.file_exists !ocm_model_1) then
+      failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_1);
+    if not (Sys.file_exists !ocm_model_2) then
+      failwith (Printf.sprintf "OCM model not found: %s" !ocm_model_2);
     if s2_bands_data.n > 0 then begin
       Printf.printf "\nRunning OmniCloudMask...\n%!";
       let t_ocm_start = Unix.gettimeofday () in
@@ -1187,6 +1194,7 @@ let () =
         ~model1_path:!ocm_model_1
         ~model2_path:!ocm_model_2
         ~n_threads:!ocm_threads
+        ~cuda_device:!cuda_device
         ~patch_size:!ocm_patch_size
         ~patch_overlap:!ocm_patch_overlap
         ~batch_size:!ocm_batch_size
@@ -1197,7 +1205,7 @@ let () =
     end else
       Printf.printf "\nSkipping OCM: no S2 timesteps\n%!"
   end else
-    Printf.printf "\nSkipping OCM: model files not found\n%!";
+    Printf.printf "\nSkipping OCM: no --ocm_model_1/--ocm_model_2 given\n%!";
 
   let t_end = Unix.gettimeofday () in
   Printf.printf "\nDone: %s (%.1fs)\n%!" grid_id (t_end -. t_start)
