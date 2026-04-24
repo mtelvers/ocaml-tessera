@@ -1,11 +1,11 @@
 (executable
- (name pipeline)
- (public_name pipeline)
- (package pipeline)
+ (name tessera_pipeline)
+ (public_name tessera-pipeline)
+ (package tessera-pipeline)
  (libraries stac_client gdal onnxruntime yojson unix bigarray))
 
 (executable
- (name dpixel)
- (public_name dpixel)
- (package dpixel)
+ (name tessera_dpixel)
+ (public_name tessera-dpixel)
+ (package tessera-dpixel)
  (libraries stac_client gdal npy onnxruntime yojson unix bigarray cmdliner))

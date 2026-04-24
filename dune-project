@@ -9,7 +9,7 @@
 (maintainers "Mark Elvers <mark.elvers@tunbury.org>")
 
 (package
- (name pipeline)
+ (name tessera-pipeline)
  (synopsis "Tessera Pipeline in OCaml")
  (description "Tessera Pipeline in OCaml")
  (depends
@@ -21,7 +21,7 @@
   yojson))
 
 (package
- (name dpixel)
+ (name tessera-dpixel)
  (synopsis "Tessera dpixel tool in OCaml")
  (description "Tessera dpixel tool in OCaml")
  (depends
