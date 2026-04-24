@@ -1,7 +1,27 @@
-(executables
- (names pipeline)
+(executable
+ (name pipeline)
+ (public_name pipeline)
+ (package pipeline)
  (libraries stac_client gdal onnxruntime yojson unix bigarray))
 
 (executable
  (name dpixel)
- (libraries stac_client gdal npy onnxruntime yojson unix bigarray))
+ (public_name dpixel)
+ (package dpixel)
+ (libraries stac_client gdal npy onnxruntime yojson unix bigarray cmdliner))
+
+(executable
+ (name bench_onnx)
+ (libraries onnxruntime unix bigarray))
+
+(executable
+ (name bench_gdal)
+ (libraries stac_client gdal unix bigarray))
+
+(executable
+ (name embeddings_size)
+ (libraries shapefile dbf unix cmdliner))
+
+(executable
+ (name test_write)
+ (libraries gdal unix bigarray))
