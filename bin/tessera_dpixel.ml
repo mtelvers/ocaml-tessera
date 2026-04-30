@@ -418,9 +418,15 @@ let process_s2 ~(roi : roi) ~(client : Stac_client.t) ~data_source ~n_workers it
                 else
                   0.0
               in
+              (* MPC stores RAW post-PB-04.00 values (+1000 offset present) and
+                 must be harmonised here. AWS Element84 earth-search has already
+                 applied the BOA_ADD_OFFSET at COG-generation time, so subtracting
+                 again would double-apply it. *)
               let v =
-                if is_after_harmonisation date_str && v >= harmonisation_offset then
-                  v -. harmonisation_offset
+                if data_source = MPC
+                   && is_after_harmonisation date_str
+                   && v >= harmonisation_offset
+                then v -. harmonisation_offset
                 else v
               in
               let v = Float.max 0.0 (Float.min 65535.0 v) in
